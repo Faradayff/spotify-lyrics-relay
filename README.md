@@ -89,6 +89,71 @@ if (s.ok && s.lyricsSynced) renderLine(s.line);
 - Automatic token refresh; tokens persisted to a `data/` volume.
 - CORS enabled on `/status` so browser-based frontends can call it.
 
+## Spotify Developer Dashboard setup
+
+Before the first `/login` works you need an app in <https://developer.spotify.com/dashboard>.
+Fill the form like this:
+
+1. Click **Create app**.
+2. **Type**: **Server-side** (not "Native / Browser-based").
+3. **App name**: anything, e.g. `spotify-lyrics-relay`.
+4. **Description**: free text.
+
+**Redirect URIs** (this is the field you asked about — enter exactly one, and it
+must be *identical* to the one you put in `SPOTIFY_REDIRECT_URI`):
+
+```
+http://localhost:8899/callback
+```
+
+> Spotify only accepts `http://localhost...` or `https://...` redirect URIs for
+> self-hosted apps. If you later publish the relay on a real domain with TLS,
+> add `https://<your-domain>/callback` to the same list — and change the env var
+> to match. Keep both in sync, otherwise Spotify will reject the callback with
+> `redirect_uri_mismatch`.
+
+**Which API/SDKs are you planning to use?** — tick exactly **one**:
+
+- [x] **Web API**
+- [ ] Ads API
+- [ ] Web Playback SDK
+- [ ] iOS
+- [ ] Android
+
+Why **Web API** and only that: this relay calls the Web API
+(`api.spotify.com/v1/me/player*`) using OAuth 2.0, and it never renders audio
+itself. The **Web Playback SDK** is the one that actually plays music in a
+browser — you don't need it here, because the song is already playing on
+whatever device is connected to **your** Premium account. The mobile SDKs
+(iOS/Android/Ads) are also irrelevant to a self-hosted HTTP relay.
+
+**Scopes** (auto-generated on the "Settings" tab of the app; the code requests
+these — no UI tick needed, they are sent on the `/login` redirect):
+
+```
+user-read-playback-state user-read-currently-playing streaming
+```
+
+- `user-read-playback-state` → lets the relay read `/me/player`
+  (current track, position, playing state).
+- `user-read-currently-playing` → `/v1/me/player/currently-playing`.
+- `streaming` → keeps the Premium license valid when the relay issues the
+  controls (`/control?action=…`) that would otherwise be rejected with
+  `403`.
+
+**Required** (the two secrets you copy into your `.env`):
+
+| Field | Goes into |
+|---|---|
+| **Client ID** | `SPOTIFY_CLIENT_ID` |
+| **Client Secret** | `SPOTIFY_CLIENT_SECRET` |
+| **Callback URI** | `SPOTIFY_REDIRECT_URI` |
+
+> Keep the **type = Server-side** selection — it unlocks `client_id` +
+> `client_secret` (the "Authorization Code with Client Secret" flow) that this
+> relay uses. A "Native / Browser-based" app would only get an implicit-flow
+> flow and would **not** work with the current code.
+
 ## Configuration
 
 | Variable | Required | Description |
