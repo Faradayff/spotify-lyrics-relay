@@ -21,7 +21,7 @@ func newRelayServer() *relayServer {
 	}
 }
 
-// --- /status (la unica ruta que consume la app del coche) ---
+// --- /status (the only route the car app consumes) ---
 
 func (s *relayServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -29,7 +29,7 @@ func (s *relayServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 	if !s.spot.authorized() {
 		writeJSON(w, http.StatusOK, map[string]any{
-			"ok": false, "auth": false, "error": "spotify no autenticado; abre /login desde un browser",
+			"ok": false, "auth": false, "error": "spotify not authenticated; open /login from a browser",
 		})
 		return
 	}
@@ -150,7 +150,7 @@ type trackInfo struct {
 	Cover  []string `json:"cover,omitempty"`
 }
 
-// --- autenticacion ---
+// --- authentication ---
 
 func (s *relayServer) handleLogin(w http.ResponseWriter, r *http.Request) {
 	url, err := s.spot.loginURL()
@@ -165,11 +165,11 @@ func (s *relayServer) handleCallback(w http.ResponseWriter, r *http.Request) {
 	code := r.URL.Query().Get("code")
 	errStr := r.URL.Query().Get("error")
 	if errStr != "" {
-		http.Error(w, "spotify devolvi\u00f3 error: "+errStr, http.StatusBadRequest)
+		http.Error(w, "spotify returned an error: "+errStr, http.StatusBadRequest)
 		return
 	}
 	if code == "" {
-		http.Error(w, "falta el parametro code", http.StatusBadRequest)
+		http.Error(w, "missing code parameter", http.StatusBadRequest)
 	}
 	if err := s.spot.exchangeCode(code); err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
@@ -177,8 +177,8 @@ func (s *relayServer) handleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprint(w, `<!doctype html><html><head><meta charset="utf-8"></head><body style="background:#0d0d0d;color:#e8e8e8;font-family:monospace;padding:24px;">
-<h3>OK, sesion guardada</h3>
-<p>El coche ya puede consumir <code>/status</code>. Cierra esta ventana.</p>
+<h3>OK, session saved</h3>
+<p>The car app can now consume <code>/status</code>. You can close this window.</p>
 </body></html>`)
 }
 
@@ -189,7 +189,7 @@ func (s *relayServer) handleLogout(w http.ResponseWriter, r *http.Request) {
 
 func (s *relayServer) handleControl(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "solo POST", http.StatusMethodNotAllowed)
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
 		return
 	}
 	_ = r.ParseForm()
@@ -204,7 +204,7 @@ func (s *relayServer) handleControl(w http.ResponseWriter, r *http.Request) {
 func (s *relayServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	authorized := s.spot.authorized()
-	status, trackName := "sin sesion", ""
+	status, trackName := "no session", ""
 	if authorized {
 		if st, err := s.spot.mePlayer(); err == nil {
 			if t, ok := st["track"].(map[string]any); ok && t != nil {
@@ -212,14 +212,14 @@ func (s *relayServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 			}
 			playing, _ := st["is_playing"].(bool)
 			if trackName == "" {
-				status = "autenticado, sin track"
+				status = "authenticated, no track"
 			} else if playing {
-				status = "reproduciendo: " + trackName
+				status = "playing: " + trackName
 			} else {
-				status = "pausado: " + trackName
+				status = "paused: " + trackName
 			}
 		} else {
-			status = "autenticado (error leyendo estado)"
+			status = "authenticated (error reading state)"
 		}
 	}
 	fmt.Fprintf(w, `<!doctype html>
@@ -231,15 +231,15 @@ a{color:#1db954} code{background:#1a1a1a;padding:1px 4px}</style>
 <h3>lyrics-relay</h3>
 <div class="box">
   <b>Spotify</b>: %s<br>
-  <b>Acciones</b>: <a href="/login">iniciar sesion</a> &middot; <a href="/logout">cerrar</a><br>
-  <b>Coche</b>: <code>GET /status</code> (JSON, CORS abierto)<br>
-  <b>Controles</b>: <code>POST /control?action=next|prev|pause|resume</code>
+  <b>Actions</b>: <a href="/login">log in</a> &middot; <a href="/logout">log out</a><br>
+  <b>Car app</b>: <code>GET /status</code> (JSON, CORS open)<br>
+  <b>Controls</b>: <code>POST /control?action=next|prev|pause|resume</code>
 </div>
 </body></html>
 `, status)
 }
 
-// --- utilidades ---
+// --- utilities ---
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")

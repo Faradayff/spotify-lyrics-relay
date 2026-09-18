@@ -93,7 +93,7 @@ func (s *spotifyClient) apply(tokenResp map[string]any) {
 
 func (s *spotifyClient) refresh() error {
 	if s.tokens.RefreshToken == "" {
-		return errors.New("refresh token ausente; vuelve a iniciar sesion con GET /login")
+		return errors.New("missing refresh token; log in again with GET /login")
 	}
 	form := url.Values{
 		"grant_type":    {"refresh_token"},
@@ -106,7 +106,7 @@ func (s *spotifyClient) refresh() error {
 		return err
 	}
 	if status != http.StatusOK {
-		return fmt.Errorf("refresh fallido: %d %s", status, string(body))
+		return fmt.Errorf("refresh failed: %d %s", status, string(body))
 	}
 	s.mu.Lock()
 	var m map[string]any
@@ -131,7 +131,7 @@ func (s *spotifyClient) accessToken() (string, error) {
 	t = s.tokens
 	s.mu.Unlock()
 	if t.AccessToken == "" {
-		return "", errors.New("sin access token")
+		return "", errors.New("no access token")
 	}
 	return t.AccessToken, nil
 }
@@ -144,7 +144,7 @@ func (s *spotifyClient) authorized() bool {
 
 func (s *spotifyClient) loginURL() (string, error) {
 	if s.clientID == "" || s.redirect == "" {
-		return "", errors.New("falta SPOTIFY_CLIENT_ID o SPOTIFY_REDIRECT_URI")
+		return "", errors.New("missing SPOTIFY_CLIENT_ID or SPOTIFY_REDIRECT_URI")
 	}
 	q := url.Values{
 		"client_id":     {s.clientID},
@@ -158,7 +158,7 @@ func (s *spotifyClient) loginURL() (string, error) {
 
 func (s *spotifyClient) exchangeCode(code string) error {
 	if s.clientID == "" || s.clientSec == "" {
-		return errors.New("falta SPOTIFY_CLIENT_ID o SPOTIFY_CLIENT_SECRET")
+		return errors.New("missing SPOTIFY_CLIENT_ID or SPOTIFY_CLIENT_SECRET")
 	}
 	form := url.Values{
 		"grant_type":    {"authorization_code"},
@@ -172,7 +172,7 @@ func (s *spotifyClient) exchangeCode(code string) error {
 		return err
 	}
 	if status != http.StatusOK {
-		return fmt.Errorf("exchange fallido: %d %s", status, string(body))
+		return fmt.Errorf("token exchange failed: %d %s", status, string(body))
 	}
 	s.mu.Lock()
 	var m map[string]any
@@ -256,7 +256,7 @@ func (s *spotifyClient) control(action string) error {
 		"resume": {"PUT", "/v1/me/player/play"},
 	}[action]
 	if !ok {
-		return fmt.Errorf("accion desconocida: %q", action)
+		return fmt.Errorf("unknown action: %q", action)
 	}
 	body, _, _, err := s.call(method, path)
 	if err != nil {

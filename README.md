@@ -1,26 +1,26 @@
 # Spotify Lyrics Relay
 
-Relay HTTP que consume la API de Spotify (OAuth 2.0) y expone un único
-endpoint JSON con la **letra sincronizada** (vía [LRClIB](https://lrclib.net))
-de la canción en reproduce.
+An HTTP relay that fetches your **Spotify** playback state and the **synced
+lyrics** (via [LRClIB](https://lrclib.net)) of the current track, exposing a
+single JSON endpoint.
 
-Pensado para ser consumido por una app Android 2.3.7 (API 10) que corra en la
-pantalla de un coche (head unit Asteroid Smart 5.8 7144), donde TLS 1.2 / SNI
-no están disponibles y una app ligera no puede hablar directo con Spotify.
+Built to be consumed by a lightweight Android 2.3.7 (API 10) app running on a
+car head unit (Asteroid Smart 5.8 7144), where modern TLS / SNI are not
+available and a small client cannot talk to Spotify directly.
 
 ```
-[Móvil Spotify Premium]  ─reproduce─▶  [Spotify Web API]
-                                              ▲
-                                              │ OAuth 2.0
-[Coche Android 2.3.7] ── GET /status ──▶  [Relay (Go, Docker)]
+[Spotify Mobile (your Premium)]  ─plays─▶  [Spotify Web API]
+                                                ▲
+                                                │ OAuth 2.0
+[Car — Android 2.3.7] ─ GET /status ─────▶  [Relay (Go, Docker)]
 ```
 
-- Go stdlib únicamente (sin dependencias)
-- Docker multi-stage, binario estático, usuario no-root
-- Secretos solo vía variables de entorno
-- `data/` volúmen para `tokens.json`
+- Go, standard library only (no external dependencies)
+- Multi-stage Dockerfile, static binary, non-root user
+- Secrets only via environment variables
+- `data/` volume for `tokens.json`
 
-## Endpoint público
+## Public endpoint
 
 ```
 GET /status   →   200 JSON
@@ -32,7 +32,7 @@ GET /status   →   200 JSON
   "auth": true,
   "playing": true,
   "positionMs": 42000,
-  "device": "Mi teléfono",
+  "device": "My phone",
   "track": { "id":"...", "name":"...", "artist":"...", "album":"...", "uri":"..." },
   "lyricsSynced": true,
   "lyricsLines": 42,
@@ -40,55 +40,60 @@ GET /status   →   200 JSON
 }
 ```
 
-`line` es el índice (0-based) dentro de la letra sincronizada, ya calculado
-con `sort.Search` sobre la lista de líneas.
+`line` is the zero-based index into the synced lyric lines, already resolved
+via `sort.Search` against the timestamped line list.
 
-Sin autenticación: `{"ok": false, "auth": false, "error": "..."}`.
+When not authenticated the response is:
 
-## Endpoints de administración
+```json
+{ "ok": false, "auth": false, "error": "..." }
+```
 
-| Ruta | Uso |
+## Management endpoints
+
+| Route | Purpose |
 |---|---|
-| `GET /` | panel HTML de estado |
-| `GET /login` | redirige a Spotify (completar **desde un browser en tu PC**) |
-| `GET /callback?code=...` | Spotify redirige aquí; intercambia código por tokens |
-| `GET /status` | el endpoint público (lo que consume el coche) |
-| `POST /control?action=next\|prev\|pause\|resume` | controles sobre la sesión |
-| `GET /logout` | borra tokens |
+| `GET /` | HTML status page |
+| `GET /login` | Redirects to Spotify (**complete from a browser on your PC**) |
+| `GET /callback?code=...` | Spotify redirects here; the code is exchanged for tokens |
+| `GET /status` | The public endpoint (what the car app consumes) |
+| `POST /control?action=next\|prev\|pause\|resume` | Control the session |
+| `GET /logout` | Clears stored tokens |
 
-## Variables de entorno
+## Environment variables
 
-| Variable | Obligatorio | Descripción |
+| Variable | Required | Description |
 |---|---|---|
-| `SPOTIFY_CLIENT_ID` | ✅ | App de developer.spotify.com (tipo: **Server-side**) |
-| `SPOTIFY_CLIENT_SECRET` | ✅ | Secret de la App |
-| `SPOTIFY_REDIRECT_URI` | ✅ | Debe casar con la registrada (Spotify solo acepta `http://localhost...` o `https://...`) |
-| `RELAY_ADDR` | no | listen, default `:8899` |
-| `STATE_DIR` | no | carpeta de tokens (por defecto `/data` en el contenedor) |
+| `SPOTIFY_CLIENT_ID` | yes | App ID from developer.spotify.com (type: **Server-side**) |
+| `SPOTIFY_CLIENT_SECRET` | yes | App secret |
+| `SPOTIFY_REDIRECT_URI` | yes | Must match the registered one exactly (Spotify only allows `http://localhost...` or `https://...`) |
+| `RELAY_ADDR` | no | Listen address, defaults to `:8899` |
+| `STATE_DIR` | no | Token storage dir (defaults to `/data` inside the container) |
 
 ## Docker
 
 ```bash
 cp .env.example .env
-# editar .env con tus credenciales
+# edit .env with your credentials
 docker compose up -d
 docker compose logs -f relay
 curl -s http://localhost:8899/status | jq
 ```
 
-> **Nota**: Spotify exige `http://localhost...` o HTTPS para `redirect_uri`.
-> Si el servidor no tiene dominio, usa un túnel de SSH para abrir `/login`:
-> `ssh -L 8899:localhost:8899 user@server` y abre `http://localhost:8899/login`
-> en el PC.
+> **Note**: Spotify requires `http://localhost...` or HTTPS for
+> `redirect_uri`. If your server has no public domain, use an SSH tunnel to
+> open `/login` in a browser:
+> `ssh -L 8899:localhost:8899 user@server`, then visit
+> `http://localhost:8899/login` on your PC.
 
-## Seguridad
+## Security
 
-- El binario corre como usuario no-root (`relay`) dentro del contenedor.
-- `data/` se monta como volumen para persistir `tokens.json`.
-- La imagen **no** guarda secretos (solo vía `ENV` runtime).
-- Si se expone a internet: reverso proxy + TLS, y añadir `RELAY_AUTH_TOKEN`
-  para autenticar `/status`.
+- The binary runs as a non-root user (`relay`) inside the container.
+- `data/` is mounted as a volume so `tokens.json` persists across restarts.
+- The image **does not** bake in any secret (runtime `ENV` only).
+- If you expose the relay to the internet: put a reverse proxy with TLS in
+  front, and consider adding authentication to `/status`.
 
-## Licencia
+## License
 
-MIT (ver [LICENSE](LICENSE) si se añade)
+MIT

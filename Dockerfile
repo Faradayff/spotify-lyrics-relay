@@ -2,12 +2,12 @@
 FROM golang:1.22-alpine AS build
 WORKDIR /src
 
-# Cargar dependencias primero (caché)
+# Load dependencies first (layer caching)
 COPY go.mod ./
-# No hay dependencias externas, pero mantenemos el paso para compatibilidad
+# No external dependencies, kept for future-proofing
 RUN go mod download
 
-# Compilar
+# Compile
 COPY *.go ./
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /relay .
 
@@ -16,7 +16,7 @@ FROM alpine:3.20
 RUN addgroup -S relay && adduser -S relay -G relay
 WORKDIR /app
 COPY --from=build /relay /usr/local/bin/relay
-# Estado (tokens.json) fuera del binario
+# State (tokens.json) kept outside the binary
 RUN mkdir -p /data && chown relay:relay /data
 ENV STATE_DIR=/data
 USER relay

@@ -1,14 +1,14 @@
 # git
 .git/
 
-# secretos / estado
+# secrets / state
 .env
 .env.local
 .env.*.local
 data/
 tokens.json
 
-# binarios / build
+# binaries / build output
 *.exe
 relay
 *.test

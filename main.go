@@ -30,7 +30,7 @@ func run(addr string) error {
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-	log.Printf("relay escuchando en %s", addr)
+	log.Printf("relay listening on %s", addr)
 	return s.ListenAndServe()
 }
 

@@ -167,7 +167,7 @@ func (l *lyricsClient) fetch(track map[string]any) (map[string]any, error) {
 
 func (l *lyricsClient) getForTrack(track map[string]any) (*lyricsData, error) {
 	if track == nil {
-		return nil, fmt.Errorf("track nulo")
+		return nil, fmt.Errorf("nil track")
 	}
 	key := fmt.Sprintf("%v", track["id"]) + "|" + l.artistName(track)
 	l.mu.Lock()

@@ -2,13 +2,13 @@
 .git
 .gitignore
 
-# secretos / estado
+# secrets / state
 .env
 .env.*
 data/
 tokens.json
 
-# binarios / build
+# binaries / build output
 *.exe
 relay
 *.test
@@ -19,5 +19,6 @@ vendor/
 .vscode/
 *.iml
 
-# docs que no importan en el build
-# (los mantenemos, solo excluidos del build)
+# docs not needed inside the image
+README.md
+LICENSE
