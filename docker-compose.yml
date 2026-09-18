@@ -4,13 +4,17 @@ services:
     image: spotify-lyrics-relay:latest
     container_name: spotify-lyrics-relay
     restart: unless-stopped
-    ports:
-      - "8899:8899"
+    # Exposed on the internal docker network only; Caddy is the public front.
+    # If you still want to hit it from the LAN, uncomment:
+    # ports:
+    #   - "127.0.0.1:8899:8899"
     environment:
-      - SPOTIFY_CLIENT_ID=${SPOTIFY_CLIENT_ID:?SPOTIFY_CLIENT_ID not set in .env}
-      - SPOTIFY_CLIENT_SECRET=${SPOTIFY_CLIENT_SECRET:?SPOTIFY_CLIENT_SECRET not set in .env}
-      - SPOTIFY_REDIRECT_URI=${SPOTIFY_REDIRECT_URI:-http://localhost:8899/callback}
-      - RELAY_ADDR=${RELAY_ADDR:-:8899}
+      # ${VAR:?msg} is shell interpolation (bash); in docker compose use the
+      # `${VAR}` form and fail-fast in `config` validation instead.
+      - SPOTIFY_CLIENT_ID=${SPOTIFY_CLIENT_ID}
+      - SPOTIFY_CLIENT_SECRET=${SPOTIFY_CLIENT_SECRET}
+      - SPOTIFY_REDIRECT_URI=https://${SPOTIFY_REDIRECT_HOST}/callback
+      - RELAY_ADDR=:8899
       - STATE_DIR=/data
     volumes:
       - ./data:/data
@@ -19,3 +23,21 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: spotify-lyrics-relay-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - relay
+
+volumes:
+  caddy_data:
+  caddy_config:

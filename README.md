@@ -99,18 +99,32 @@ Fill the form like this:
 3. **App name**: anything, e.g. `spotify-lyrics-relay`.
 4. **Description**: free text.
 
-**Redirect URIs** (this is the field you asked about — enter exactly one, and it
-must be *identical* to the one you put in `SPOTIFY_REDIRECT_URI`):
+**Redirect URIs** (this is the field you asked about — enter exactly one, and
+it must be *identical* to the one you put in `SPOTIFY_REDIRECT_URI` / used in
+the `Caddyfile`):
 
 ```
-http://localhost:8899/callback
+https://<your-public-hostname>/callback
 ```
 
-> Spotify only accepts `http://localhost...` or `https://...` redirect URIs for
-> self-hosted apps. If you later publish the relay on a real domain with TLS,
-> add `https://<your-domain>/callback` to the same list — and change the env var
-> to match. Keep both in sync, otherwise Spotify will reject the callback with
-> `redirect_uri_mismatch`.
+`<your-public-hostname>` is the DNS name that resolves to the box running this
+stack — e.g. a subdomain of your DDNS such as `relay.yourdomain.com`.
+
+> **Why HTTPS?** Spotify rejects insecure `http://` redirect URIs for
+> self-hosted apps (the dashboard shows *"This redirect URI is not secure"*).
+> For a `localhost` URI it allows the exception — but only for *local*
+> development, not for a relay that lives behind a DDNS / NAT.
+> The cleanest fix is to terminate TLS with a reverse proxy. This repo ships a
+> **Caddy** configuration ([`Caddyfile`](Caddyfile) + the `caddy` service in
+> the compose file) that obtains a free Let's Encrypt certificate
+> automatically. See *"Running with Caddy"* below.
+>
+> Keep all three in sync at all times, otherwise Spotify will reject the
+> callback with `redirect_uri_mismatch`:
+>
+> 1. The URI you paste into the Spotify dashboard
+> 2. `SPOTIFY_REDIRECT_HOST` in `.env`
+> 3. The hostname at the top of `Caddyfile`
 
 **Which API/SDKs are you planning to use?** — tick exactly **one**:
 
@@ -160,7 +174,8 @@ user-read-playback-state user-read-currently-playing streaming
 |---|---|---|
 | `SPOTIFY_CLIENT_ID` | yes | App ID from developer.spotify.com (type: **Server-side**) |
 | `SPOTIFY_CLIENT_SECRET` | yes | App secret |
-| `SPOTIFY_REDIRECT_URI` | yes | Must match the registered one exactly (Spotify only allows `http://localhost...` or `https://...`) |
+| `SPOTIFY_REDIRECT_URI` | yes | Must match the registered one exactly. Spotify rejects insecure `http://` URIs for self-hosted apps — use `https://<host>/callback`. |
+| `SPOTIFY_REDIRECT_HOST` | yes (in this repo's compose) | Public hostname (your DDNS). Used to build `SPOTIFY_REDIRECT_URI` and must match the host in `Caddyfile`. |
 | `RELAY_ADDR` | no | Listen address, defaults to `:8899` |
 | `STATE_DIR` | no | Token storage dir (defaults to `/data` inside the container) |
 
@@ -179,8 +194,44 @@ curl -s http://localhost:8899/status | jq
 ### Option B — pull the pre-built image from GHCR
 
 This repo publishes an image to the GitHub Container Registry on every push
-to `main` (`ghcr.io/<owner>/spotify-lyrics-relay`). Example `docker-compose.yml`
-on the consuming server:
+to `main` (`ghcr.io/<owner>/spotify-lyrics-relay`).
+
+**With Caddy (recommended, gives you HTTPS for Spotify login):**
+
+```yaml
+services:
+  relay:
+    image: ghcr.io/yourusername/spotify-lyrics-relay:latest
+    restart: unless-stopped
+    environment:
+      - SPOTIFY_CLIENT_ID=${SPOTIFY_CLIENT_ID}
+      - SPOTIFY_CLIENT_SECRET=${SPOTIFY_CLIENT_SECRET}
+      - SPOTIFY_REDIRECT_URI=https://${SPOTIFY_REDIRECT_HOST}/callback
+      - RELAY_ADDR=:8899
+    volumes:
+      - ./data:/data
+    depends_on:
+      - caddy
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - relay
+
+volumes:
+  caddy_data:
+  caddy_config:
+```
+
+**Without a public hostname (pure LAN dev):**
 
 ```yaml
 services:
@@ -193,41 +244,81 @@ services:
     environment:
       - SPOTIFY_CLIENT_ID=${SPOTIFY_CLIENT_ID}
       - SPOTIFY_CLIENT_SECRET=${SPOTIFY_CLIENT_SECRET}
-      - SPOTIFY_REDIRECT_URI=${SPOTIFY_REDIRECT_URI:-http://localhost:8899/callback}
+      - SPOTIFY_REDIRECT_URI=http://localhost:8899/callback
     volumes:
       - ./data:/data
-    healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8899/"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
 ```
 
-Store `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` / `SPOTIFY_REDIRECT_URI`
+> This mode **only** works if you complete the login from the same machine
+> that runs Docker (since the `localhost` redirect URI is validated by Spotify
+> in the browser). On a remote host you need a public hostname or an SSH
+> tunnel (see below).
+
+Store `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` / `SPOTIFY_REDIRECT_HOST`
 in a `.env` file next to the compose file (or in your Docker secrets /
 environment) so they are never committed:
 
 ```bash
-docker compose pull && docker compose up -d
-docker compose logs -f spotify-lyrics-relay
+docker compose up -d
+docker compose logs -f relay
+curl -s https://<your-host>/status | jq
 ```
 
-To authenticate, open `http://<server>:8899/login` in a browser (see the note
-below about the OSS redirect).
-
-> **Note on the OAuth redirect**: Spotify only accepts `http://localhost...`
-> or `https://...` as a redirect URI. The easiest way to log in when the relay
-> runs on a remote server is an SSH tunnel:
-> `ssh -L 8899:localhost:8899 user@server`, then open
-> `http://localhost:8899/login` in a browser on your machine.
+> **Note on the OAuth redirect**: if you do **not** have a public hostname,
+> the last resort is an SSH tunnel to the box running the relay:
+> `ssh -N -L 8899:localhost:8899 user@server`, then open
+> `http://localhost:8899/login` on your own PC while `relay`'s
+> `SPOTIFY_REDIRECT_URI` is `http://localhost:8899/callback`. After that the
+> tunnel can be closed and the relay keeps working normally. This only affects
+> the one-time login.
 
 ## Running without Docker
 
 ```bash
 go build -o spotify-lyrics-relay .
-SPOTIFY_CLIENT_ID=... SPOTIFY_CLIENT_SECRET=... SPOTIFY_REDIRECT_URI=http://localhost:8899/callback \
+SPOTIFY_CLIENT_ID=... SPOTIFY_CLIENT_SECRET=... SPOTIFY_REDIRECT_URI=https://<your-host>/callback \
   ./spotify-lyrics-relay
 ```
+
+(With a Go-only setup you still need to put a TLS-terminating reverse proxy
+in front, or Spotify will reject the redirect.)
+
+## Running with Caddy (public HTTPS for Spotify login)
+
+The repo ships [`Caddyfile`](Caddyfile) and a `caddy` service in
+[`docker-compose.yml`](docker-compose.yml). Caddy handles TLS end-to-end
+(Let's Encrypt, auto-renewed) and proxies to the relay, so:
+
+- You **don't** forward port 8899 on your router (only 80 and 443).
+- Spotify sees a valid `https://` redirect URI.
+- The `/status` endpoint is reachable at `https://<your-host>/status`
+  (great for remote dashboards too).
+
+### Checklist
+
+1. **DNS**: a hostname (e.g. `relay.yourdomain.com`) whose A / AAAA record
+   points to the **public IP of the box running this stack**. If you use a
+   DDNS, the hostname can be a subdomain of it, as long as the final name
+   resolves to that box.
+2. **Router ports**: forward **80/tcp** and **443/tcp** to that box (Caddy
+   needs 80 for the Let's Encrypt HTTP-01 challenge).
+3. **Edit files** so the three values match:
+   - `Caddyfile` → replace `your-hostname.tld` with your hostname.
+   - `.env` → set `SPOTIFY_REDIRECT_HOST=<your-host>`
+     (the relay's `SPOTIFY_REDIRECT_URI` is built as
+     `https://<your-host>/callback`).
+   - Spotify dashboard → add the **same** `https://<your-host>/callback`.
+4. **Run**:
+   ```bash
+   cp .env.example .env
+   # fill SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET / SPOTIFY_REDIRECT_HOST
+   docker compose up -d
+   docker compose logs -f caddy     # first start obtains the certificate
+   docker compose logs -f relay
+   ```
+5. **Log in**: open `https://<your-host>/login` in a browser, authorize, and
+   the callback lands on `.../callback`. Done.
+6. **From the car / LAN**: `curl -s https://<your-host>/status | jq`.
 
 ## Security
 
