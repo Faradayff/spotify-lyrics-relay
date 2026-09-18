@@ -1,0 +1,20 @@
+# git
+.git/
+
+# secretos / estado
+.env
+.env.local
+.env.*.local
+data/
+tokens.json
+
+# binarios / build
+*.exe
+relay
+*.test
+vendor/
+
+# IDE
+.idea/
+.vscode/
+*.iml

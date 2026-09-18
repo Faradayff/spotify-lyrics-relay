@@ -1,0 +1,23 @@
+# git
+.git
+.gitignore
+
+# secretos / estado
+.env
+.env.*
+data/
+tokens.json
+
+# binarios / build
+*.exe
+relay
+*.test
+vendor/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# docs que no importan en el build
+# (los mantenemos, solo excluidos del build)

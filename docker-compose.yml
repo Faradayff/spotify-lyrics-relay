@@ -1,0 +1,21 @@
+services:
+  relay:
+    build: .
+    image: ghcr.io/Faradayff/spotify-lyrics-relay:latest
+    container_name: spotify-lyrics-relay
+    restart: unless-stopped
+    ports:
+      - "8899:8899"
+    environment:
+      - SPOTIFY_CLIENT_ID=${SPOTIFY_CLIENT_ID:?SPOTIFY_CLIENT_ID no definida en .env}
+      - SPOTIFY_CLIENT_SECRET=${SPOTIFY_CLIENT_SECRET:?SPOTIFY_CLIENT_SECRET no definida en .env}
+      - SPOTIFY_REDIRECT_URI=${SPOTIFY_REDIRECT_URI:-http://localhost:8899/callback}
+      - RELAY_ADDR=${RELAY_ADDR:-:8899}
+      - STATE_DIR=/data
+    volumes:
+      - ./data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8899/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
