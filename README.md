@@ -101,6 +101,8 @@ if (s.ok && s.lyricsSynced) renderLine(s.line);
 
 ## Running with Docker
 
+### Option A — build locally (the `docker-compose.yml` in this repo)
+
 ```bash
 cp .env.example .env
 # edit .env with your credentials
@@ -108,6 +110,45 @@ docker compose up -d
 docker compose logs -f relay
 curl -s http://localhost:8899/status | jq
 ```
+
+### Option B — pull the pre-built image from GHCR
+
+This repo publishes an image to the GitHub Container Registry on every push
+to `main` (`ghcr.io/<owner>/spotify-lyrics-relay`). Example `docker-compose.yml`
+on the consuming server:
+
+```yaml
+services:
+  spotify-lyrics-relay:
+    image: ghcr.io/yourusername/spotify-lyrics-relay:latest
+    container_name: spotify-lyrics-relay
+    restart: unless-stopped
+    ports:
+      - "8899:8899"
+    environment:
+      - SPOTIFY_CLIENT_ID=${SPOTIFY_CLIENT_ID}
+      - SPOTIFY_CLIENT_SECRET=${SPOTIFY_CLIENT_SECRET}
+      - SPOTIFY_REDIRECT_URI=${SPOTIFY_REDIRECT_URI:-http://localhost:8899/callback}
+    volumes:
+      - ./data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8899/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+```
+
+Store `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` / `SPOTIFY_REDIRECT_URI`
+in a `.env` file next to the compose file (or in your Docker secrets /
+environment) so they are never committed:
+
+```bash
+docker compose pull && docker compose up -d
+docker compose logs -f spotify-lyrics-relay
+```
+
+To authenticate, open `http://<server>:8899/login` in a browser (see the note
+below about the OSS redirect).
 
 > **Note on the OAuth redirect**: Spotify only accepts `http://localhost...`
 > or `https://...` as a redirect URI. The easiest way to log in when the relay

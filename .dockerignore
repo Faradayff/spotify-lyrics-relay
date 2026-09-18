@@ -8,7 +8,7 @@
 data/
 tokens.json
 
-# binaries / build output
+# binary / build outputs
 *.exe
 relay
 *.test

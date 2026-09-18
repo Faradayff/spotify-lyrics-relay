@@ -249,7 +249,7 @@ func (s *spotifyClient) mePlayer() (map[string]any, error) {
 }
 
 func (s *spotifyClient) control(action string) error {
-	method, path, ok := map[string][2]string{
+	pair, ok := map[string][2]string{
 		"next":   {"POST", "/v1/me/player/next"},
 		"prev":   {"POST", "/v1/me/player/previous"},
 		"pause":  {"PUT", "/v1/me/player/pause"},
@@ -258,6 +258,7 @@ func (s *spotifyClient) control(action string) error {
 	if !ok {
 		return fmt.Errorf("unknown action: %q", action)
 	}
+	method, path := pair[0], pair[1]
 	body, _, _, err := s.call(method, path)
 	if err != nil {
 		return err
