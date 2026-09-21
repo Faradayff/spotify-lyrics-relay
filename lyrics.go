@@ -126,8 +126,11 @@ func (l *lyricsClient) fetch(track map[string]any) (map[string]any, error) {
 		albumName, _ = a["name"].(string)
 	}
 	durMs := 0
-	if v, ok := track["duration_ms"].(float64); ok {
+	switch v := track["duration_ms"].(type) {
+	case float64:
 		durMs = int(v)
+	case int:
+		durMs = v
 	}
 	q := url.Values{}
 	q.Set("track_name", name)
@@ -165,6 +168,29 @@ func (l *lyricsClient) fetch(track map[string]any) (map[string]any, error) {
 	return m, nil
 }
 
+// decodeLyrics maps a LRCLIB /get response (fields "syncedLyrics" /
+// "plainLyrics") into lyricsData.
+func decodeLyrics(m map[string]any) lyricsData {
+	out := lyricsData{}
+	if m == nil {
+		return out
+	}
+	var synced, plain string
+	if s, ok := m["syncedLyrics"].(string); ok {
+		synced = s
+	}
+	if p, ok := m["plainLyrics"].(string); ok {
+		plain = p
+	}
+	if lines := parseLRC(synced); len(lines) > 0 {
+		return lyricsData{Synced: true, Lines: lines, Plain: plain, LinesCount: len(lines)}
+	}
+	if plain != "" {
+		return lyricsData{Synced: false, Plain: plain}
+	}
+	return out
+}
+
 func (l *lyricsClient) getForTrack(track map[string]any) (*lyricsData, error) {
 	if track == nil {
 		return nil, fmt.Errorf("nil track")
@@ -181,22 +207,7 @@ func (l *lyricsClient) getForTrack(track map[string]any) (*lyricsData, error) {
 	if err != nil {
 		return nil, err
 	}
-	out := lyricsData{}
-	if m != nil {
-		if s, ok := m["synced"].(string); ok && s != "" {
-			lines := parseLRC(s)
-			if len(lines) > 0 {
-				out = lyricsData{
-					Synced:     true,
-					Lines:      lines,
-					Plain:      strOr(m["plain"]),
-					LinesCount: len(lines),
-				}
-			}
-		} else if p, ok := m["plain"].(string); ok && p != "" {
-			out = lyricsData{Synced: false, Plain: p}
-		}
-	}
+	out := decodeLyrics(m)
 	l.mu.Lock()
 	l.cache[key] = cacheEntry{at: time.Now(), data: out}
 	l.mu.Unlock()

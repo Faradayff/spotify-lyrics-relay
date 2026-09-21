@@ -51,3 +51,45 @@ func TestFindLine(t *testing.T) {
 		t.Fatalf("25s expected 2 got %d", i)
 	}
 }
+
+// TestDecodeLyrics_RealAPIShape reproduces the exact field names the
+// LRCLIB /get endpoint returns (verified live: "syncedLyrics" /
+// "plainLyrics"), so regressions to "synced" / "plain" fail here.
+func TestDecodeLyrics_RealAPIShape(t *testing.T) {
+	m := map[string]any{
+		"id":           "3q2CVvw9bZu6aWn1PnS4jF",
+		"trackName":    "Bohemian Rhapsody",
+		"albumName":    "A Night at the Opera",
+		"duration":     354,
+		"plainLyrics":  "Is this the real life?",
+		"syncedLyrics": "[00:00.15] Is this the real life?\n[00:07.13] Caught in a landslide",
+		"lyricsfile":   "https://lrclib.net/api/lyrics/...",
+	}
+	out := decodeLyrics(m)
+	if !out.Synced {
+		t.Fatalf("expected synced lyrics, got %+v", out)
+	}
+	if out.LinesCount != 2 || len(out.Lines) != 2 {
+		t.Fatalf("expected 2 lines, got %+v", out.Lines)
+	}
+	if out.Lines[0].T != 150 || out.Lines[0].Text != "Is this the real life?" {
+		t.Fatalf("line 0 wrong: %+v", out.Lines[0])
+	}
+	if out.Plain != "Is this the real life?" {
+		t.Fatalf("plain wrong: %q", out.Plain)
+	}
+
+	// Plain-only response.
+	plain := decodeLyrics(map[string]any{"plainLyrics": "hello"})
+	if plain.Synced || plain.Plain != "hello" {
+		t.Fatalf("plain-only wrong: %+v", plain)
+	}
+
+	// Empty / missing fields must yield empty data (no crash).
+	if d := decodeLyrics(map[string]any{}); d.Synced || d.Plain != "" {
+		t.Fatalf("empty wrong: %+v", d)
+	}
+	if d := decodeLyrics(nil); d.Synced || d.Plain != "" {
+		t.Fatalf("nil wrong: %+v", d)
+	}
+}

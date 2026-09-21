@@ -76,6 +76,9 @@ func (s *relayServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *relayServer) lyricsFor(ti *trackInfo, estMs int) (int, bool, int, error) {
+	if ti == nil || ti.ID == "" {
+		return -1, false, 0, nil
+	}
 	track := map[string]any{
 		"id":          ti.ID,
 		"name":        ti.Name,
