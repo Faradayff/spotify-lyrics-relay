@@ -43,7 +43,6 @@ GET /status   →   200 JSON
   "auth": true,
   "playing": true,
   "positionMs": 42000,
-  "device": "My phone",
   "track": { "id":"...", "name":"...", "artist":"...", "album":"...", "uri":"..." },
   "lyricsSynced": true,
   "lyricsLines": 42,
@@ -114,8 +113,11 @@ https://your-public.hostname/lyrics/callback
 
 > **Why HTTPS and a base path?** Spotify rejects insecure `http://` redirect
 > URIs for self-hosted apps (the dashboard shows *"This redirect URI is not
-> secure"*). It only allows the `http://localhost` exception for local
-> development, not for a relay behind a DDNS / NAT.
+> secure"*). The only `http://` exception is the **loopback address** —
+> `http://127.0.0.1:PORT/...` (or `http://[::1]:PORT/...`) for local
+> development. The literal name `localhost` is rejected, and a loopback URI
+> only works from the machine that runs the relay (browser on the same host),
+> so it does not replace a real HTTPS URL behind a reverse proxy.
 >
 > If a reverse proxy or web server already terminates TLS on ports **80** /
 > **443** for your host, let it forward a base path — `/lyrics` here — to the
@@ -177,8 +179,8 @@ user-read-playback-state user-read-currently-playing streaming
 |---|---|---|
 | `SPOTIFY_CLIENT_ID` | yes | App ID from developer.spotify.com (type: **Server-side**) |
 | `SPOTIFY_CLIENT_SECRET` | yes | App secret |
-| `SPOTIFY_REDIRECT_URI` | yes | Must match the registered one exactly (Spotify requires `https://...` except `localhost`). |
-| `RELAY_BASE_PATH` | no | Base path all routes are served under (e.g. `/lyrics`); empty for `http://localhost:8899/...`. Must be a prefix of `SPOTIFY_REDIRECT_URI`. |
+| `SPOTIFY_REDIRECT_URI` | yes | Must match the registered one exactly (Spotify requires `https://...`, except loopback `http://127.0.0.1:PORT/...`). |
+| `RELAY_BASE_PATH` | no | Base path all routes are served under (e.g. `/lyrics`); empty for `http://127.0.0.1:8899/...`. Must be a prefix of `SPOTIFY_REDIRECT_URI`. |
 | `RELAY_ADDR` | no | Listen address, defaults to `:8899` |
 | `STATE_DIR` | no | Token storage dir (defaults to `/data` inside the container) |
 
@@ -186,21 +188,29 @@ user-read-playback-state user-read-currently-playing streaming
 
 ### Option A — local development on any machine
 
-No public hostname needed. Spotify accepts the `http://localhost` redirect, so
-this is the fastest way to develop against a live session:
+No public hostname needed. Spotify accepts the **loopback** redirect
+`http://127.0.0.1:8899/callback` (the literal name `localhost` is rejected),
+so this is the fastest way to develop against a live session:
 
 ```bash
 cp .env.example .env
 # in .env set:
 #   SPOTIFY_CLIENT_ID=...
 #   SPOTIFY_CLIENT_SECRET=...
-#   SPOTIFY_REDIRECT_URI=http://localhost:8899/callback
+#   SPOTIFY_REDIRECT_URI=http://127.0.0.1:8899/callback
 #   RELAY_BASE_PATH=        (empty)
 docker compose up -d --build
 docker compose logs -f relay
-curl -s http://localhost:8899/status | jq
-# then open http://localhost:8899/login in a browser on that machine
+curl -s http://127.0.0.1:8899/status | jq
+# then open http://127.0.0.1:8899/login in a browser on that machine
 ```
+
+> The browser must be able to reach the loopback of the machine that runs the
+> relay. If your browser is on a *different* host (e.g. Windows using a WSL2 /
+> VM), the callback page won't load — that's fine: the URL in your address bar
+> contains `?code=...`. Copy that URL and request it from the relay's machine
+> instead: `curl 'http://127.0.0.1:8899/callback?code=…'` — the relay does the
+> token exchange and prints "OK, session saved".
 
 ### Option B — production behind a reverse proxy
 

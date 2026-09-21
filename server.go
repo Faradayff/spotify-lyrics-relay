@@ -44,13 +44,9 @@ func (s *relayServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now()
-	trackRaw, _ := st["track"].(map[string]any)
+	trackRaw := trackFromState(st)
 	isPlaying := boolOr(st["is_playing"])
 	position := intOr(st["progress_ms"])
-	deviceName := ""
-	if dev, ok := st["device"].(map[string]any); ok {
-		deviceName, _ = dev["name"].(string)
-	}
 
 	ti := buildTrackInfo(s.lyrics, trackRaw)
 	lineIdx, lyrSynced, lyrCount, lyrErr := s.lyricsFor(ti, position)
@@ -61,7 +57,6 @@ func (s *relayServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"playing":      isPlaying,
 		"positionMs":   position,
 		"updated":      now.UTC().Format(time.RFC3339),
-		"device":       deviceName,
 		"track":        ti,
 		"lyricsSynced": lyrSynced,
 		"lyricsLines":  lyrCount,
@@ -212,9 +207,7 @@ func (s *relayServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 	status, trackName := "no session", ""
 	if authorized {
 		if st, err := s.spot.mePlayer(); err == nil {
-			if t, ok := st["track"].(map[string]any); ok && t != nil {
-				trackName, _ = t["name"].(string)
-			}
+			trackName, _ = trackFromState(st)["name"].(string)
 			playing, _ := st["is_playing"].(bool)
 			if trackName == "" {
 				status = "authenticated, no track"
@@ -245,6 +238,18 @@ a{color:#1db954} code{background:#1a1a1a;padding:1px 4px}</style>
 }
 
 // --- utilities ---
+
+// trackFromState extracts the playing track from a playback-state object.
+// Modern Spotify responses use "item"; older snapshots used "track".
+func trackFromState(st map[string]any) map[string]any {
+	if m, ok := st["item"].(map[string]any); ok && m != nil {
+		return m
+	}
+	if m, ok := st["track"].(map[string]any); ok && m != nil {
+		return m
+	}
+	return nil
+}
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")

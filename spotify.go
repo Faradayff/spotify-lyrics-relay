@@ -231,8 +231,11 @@ func (s *spotifyClient) call(method, path string) (io.ReadCloser, int, http.Head
 	return resp.Body, resp.StatusCode, resp.Header, nil
 }
 
+// mePlayer returns the current playback state. Uses the modern
+// /v1/me/player/currently_playing endpoint: the legacy /v1/me/player
+// response no longer exposes the playing track under "track".
 func (s *spotifyClient) mePlayer() (map[string]any, error) {
-	body, _, _, err := s.call("GET", "/v1/me/player")
+	body, _, _, err := s.call("GET", "/v1/me/player/currently_playing")
 	if err != nil {
 		return nil, err
 	}

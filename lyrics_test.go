@@ -93,3 +93,27 @@ func TestDecodeLyrics_RealAPIShape(t *testing.T) {
 		t.Fatalf("nil wrong: %+v", d)
 	}
 }
+
+func TestTrackFromState_ItemAndTrack(t *testing.T) {
+	want := map[string]any{"id": "4uLU64mcE15tl0lwSjmOqz", "name": "Bohemian Rhapsody"}
+
+	// Modern responses carry the track under "item".
+	latest := map[string]any{"item": want, "is_playing": true, "progress_ms": float64(42000)}
+	if got := trackFromState(latest); got["id"] != "4uLU64mcE15tl0lwSjmOqz" {
+		t.Fatalf("item not picked: %+v", got)
+	}
+
+	// Older snapshots used "track"; fallback must still work.
+	legacy := map[string]any{"track": want, "is_playing": true}
+	if got := trackFromState(legacy); got["id"] != "4uLU64mcE15tl0lwSjmOqz" {
+		t.Fatalf("track fallback failed: %+v", got)
+	}
+
+	// Nothing playing, item explicitly null.
+	if got := trackFromState(map[string]any{"item": nil, "progress_ms": float64(0)}); got != nil {
+		t.Fatalf("expected nil track, got: %+v", got)
+	}
+	if got := trackFromState(nil); got != nil {
+		t.Fatalf("nil state must yield nil track")
+	}
+}
