@@ -100,31 +100,34 @@ Fill the form like this:
 4. **Description**: free text.
 
 **Redirect URIs** (this is the field you asked about — enter exactly one, and
-it must be *identical* to the one you put in `SPOTIFY_REDIRECT_URI` / used in
-the `Caddyfile`):
+it must be *identical* to the one you put in `SPOTIFY_REDIRECT_URI`):
 
 ```
-https://<your-public-hostname>/callback
+https://<your-public-hostname>/lyrics/callback
 ```
 
-`<your-public-hostname>` is the DNS name that resolves to the box running this
-stack — e.g. a subdomain of your DDNS such as `relay.yourdomain.com`.
+For example, with a reverse proxy mounted under a base path `/lyrics`:
 
-> **Why HTTPS?** Spotify rejects insecure `http://` redirect URIs for
-> self-hosted apps (the dashboard shows *"This redirect URI is not secure"*).
-> For a `localhost` URI it allows the exception — but only for *local*
-> development, not for a relay that lives behind a DDNS / NAT.
-> The cleanest fix is to terminate TLS with a reverse proxy. This repo ships a
-> **Caddy** configuration ([`Caddyfile`](Caddyfile) + the `caddy` service in
-> the compose file) that obtains a free Let's Encrypt certificate
-> automatically. See *"Running with Caddy"* below.
+```
+https://your-public.hostname/lyrics/callback
+```
+
+> **Why HTTPS and a base path?** Spotify rejects insecure `http://` redirect
+> URIs for self-hosted apps (the dashboard shows *"This redirect URI is not
+> secure"*). It only allows the `http://localhost` exception for local
+> development, not for a relay behind a DDNS / NAT.
 >
-> Keep all three in sync at all times, otherwise Spotify will reject the
-> callback with `redirect_uri_mismatch`:
+> If a reverse proxy or web server already terminates TLS on ports **80** /
+> **443** for your host, let it forward a base path — `/lyrics` here — to the
+> relay instead of running a second TLS stack. The relay supports any base
+> path via `RELAY_BASE_PATH`. See *"Running behind a reverse proxy"*.
+>
+> Keep these in sync or Spotify will reject the callback with
+> `redirect_uri_mismatch`:
 >
 > 1. The URI you paste into the Spotify dashboard
-> 2. `SPOTIFY_REDIRECT_HOST` in `.env`
-> 3. The hostname at the top of `Caddyfile`
+> 2. `SPOTIFY_REDIRECT_URI` in `.env`
+> 3. `RELAY_BASE_PATH` in `.env` (must match the proxy rule's *URI*)
 
 **Which API/SDKs are you planning to use?** — tick exactly **one**:
 
@@ -174,103 +177,57 @@ user-read-playback-state user-read-currently-playing streaming
 |---|---|---|
 | `SPOTIFY_CLIENT_ID` | yes | App ID from developer.spotify.com (type: **Server-side**) |
 | `SPOTIFY_CLIENT_SECRET` | yes | App secret |
-| `SPOTIFY_REDIRECT_URI` | yes | Must match the registered one exactly. Spotify rejects insecure `http://` URIs for self-hosted apps — use `https://<host>/callback`. |
-| `SPOTIFY_REDIRECT_HOST` | yes (in this repo's compose) | Public hostname (your DDNS). Used to build `SPOTIFY_REDIRECT_URI` and must match the host in `Caddyfile`. |
+| `SPOTIFY_REDIRECT_URI` | yes | Must match the registered one exactly (Spotify requires `https://...` except `localhost`). |
+| `RELAY_BASE_PATH` | no | Base path all routes are served under (e.g. `/lyrics`); empty for `http://localhost:8899/...`. Must be a prefix of `SPOTIFY_REDIRECT_URI`. |
 | `RELAY_ADDR` | no | Listen address, defaults to `:8899` |
 | `STATE_DIR` | no | Token storage dir (defaults to `/data` inside the container) |
 
 ## Running with Docker
 
-### Option A — build locally (the `docker-compose.yml` in this repo)
+### Option A — local development on any machine
+
+No public hostname needed. Spotify accepts the `http://localhost` redirect, so
+this is the fastest way to develop against a live session:
 
 ```bash
 cp .env.example .env
-# edit .env with your credentials
-docker compose up -d
+# in .env set:
+#   SPOTIFY_CLIENT_ID=...
+#   SPOTIFY_CLIENT_SECRET=...
+#   SPOTIFY_REDIRECT_URI=http://localhost:8899/callback
+#   RELAY_BASE_PATH=        (empty)
+docker compose up -d --build
 docker compose logs -f relay
 curl -s http://localhost:8899/status | jq
+# then open http://localhost:8899/login in a browser on that machine
 ```
 
-### Option B — pull the pre-built image from GHCR
+### Option B — production behind a reverse proxy
 
-This repo publishes an image to the GitHub Container Registry on every push
-to `main` (`ghcr.io/<owner>/spotify-lyrics-relay`).
-
-**With Caddy (recommended, gives you HTTPS for Spotify login):**
+This is the layout this repo is configured for. A reverse proxy terminates TLS
+(it already holds a valid certificate) and forwards one base path to the
+container. Only loopback traffic reaches port 8899. See *"Running behind a
+reverse proxy"* below for the exact rule.
 
 ```yaml
 services:
   relay:
     image: ghcr.io/yourusername/spotify-lyrics-relay:latest
-    restart: unless-stopped
-    environment:
-      - SPOTIFY_CLIENT_ID=${SPOTIFY_CLIENT_ID}
-      - SPOTIFY_CLIENT_SECRET=${SPOTIFY_CLIENT_SECRET}
-      - SPOTIFY_REDIRECT_URI=https://${SPOTIFY_REDIRECT_HOST}/callback
-      - RELAY_ADDR=:8899
-    volumes:
-      - ./data:/data
-    depends_on:
-      - caddy
-
-  caddy:
-    image: caddy:2-alpine
-    restart: unless-stopped
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy_data:/data
-      - caddy_config:/config
-    depends_on:
-      - relay
-
-volumes:
-  caddy_data:
-  caddy_config:
-```
-
-**Without a public hostname (pure LAN dev):**
-
-```yaml
-services:
-  spotify-lyrics-relay:
-    image: ghcr.io/yourusername/spotify-lyrics-relay:latest
     container_name: spotify-lyrics-relay
     restart: unless-stopped
     ports:
-      - "8899:8899"
+      - "127.0.0.1:8899:8899"
     environment:
       - SPOTIFY_CLIENT_ID=${SPOTIFY_CLIENT_ID}
       - SPOTIFY_CLIENT_SECRET=${SPOTIFY_CLIENT_SECRET}
-      - SPOTIFY_REDIRECT_URI=http://localhost:8899/callback
+      - SPOTIFY_REDIRECT_URI=https://your-public.hostname/lyrics/callback
+      - RELAY_BASE_PATH=/lyrics
     volumes:
       - ./data:/data
 ```
 
-> This mode **only** works if you complete the login from the same machine
-> that runs Docker (since the `localhost` redirect URI is validated by Spotify
-> in the browser). On a remote host you need a public hostname or an SSH
-> tunnel (see below).
-
-Store `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` / `SPOTIFY_REDIRECT_HOST`
-in a `.env` file next to the compose file (or in your Docker secrets /
-environment) so they are never committed:
-
-```bash
-docker compose up -d
-docker compose logs -f relay
-curl -s https://<your-host>/status | jq
-```
-
-> **Note on the OAuth redirect**: if you do **not** have a public hostname,
-> the last resort is an SSH tunnel to the box running the relay:
-> `ssh -N -L 8899:localhost:8899 user@server`, then open
-> `http://localhost:8899/login` on your own PC while `relay`'s
-> `SPOTIFY_REDIRECT_URI` is `http://localhost:8899/callback`. After that the
-> tunnel can be closed and the relay keeps working normally. This only affects
-> the one-time login.
+Keep `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` in `.env` (next to the
+compose file), not in the image or a committed file.
 
 ## Running without Docker
 
@@ -280,53 +237,85 @@ SPOTIFY_CLIENT_ID=... SPOTIFY_CLIENT_SECRET=... SPOTIFY_REDIRECT_URI=https://<yo
   ./spotify-lyrics-relay
 ```
 
-(With a Go-only setup you still need to put a TLS-terminating reverse proxy
-in front, or Spotify will reject the redirect.)
+(With a Go-only setup you still need a TLS-terminating reverse proxy in front,
+or Spotify will reject the redirect.)
 
-## Running with Caddy (public HTTPS for Spotify login)
+## Running behind a reverse proxy
 
-The repo ships [`Caddyfile`](Caddyfile) and a `caddy` service in
-[`docker-compose.yml`](docker-compose.yml). Caddy handles TLS end-to-end
-(Let's Encrypt, auto-renewed) and proxies to the relay, so:
+This repo is set up for any server where ports 80 and 443 are already used by
+a TLS-terminating proxy. The trick: **don't run a second TLS stack at all**. Let
+the existing proxy (which already holds a valid certificate for your host)
+forward a base path to the relay, which only listens on the machine's
+loopback.
 
-- You **don't** forward port 8899 on your router (only 80 and 443).
-- Spotify sees a valid `https://` redirect URI.
-- The `/status` endpoint is reachable at `https://<your-host>/status`
-  (great for remote dashboards too).
+- Relay container: `127.0.0.1:8899` (nothing exposed on the router).
+- Proxy rule: `https://your-public.hostname/lyrics/*` → `http://127.0.0.1:8899/*`.
+- The relay serves *every* route under a configurable base path
+  (`RELAY_BASE_PATH`, e.g. `/lyrics`), including `/status`, `/login`,
+  `/callback`, `/control`, `/logout`.
+
+So the public URLs are:
+- Login:    `https://your-public.hostname/lyrics/login`
+- Callback: `https://your-public.hostname/lyrics/callback`  ← register this
+- JSON API: `https://your-public.hostname/lyrics/status`
 
 ### Checklist
 
-1. **DNS**: a hostname (e.g. `relay.yourdomain.com`) whose A / AAAA record
-   points to the **public IP of the box running this stack**. If you use a
-   DDNS, the hostname can be a subdomain of it, as long as the final name
-   resolves to that box.
-2. **Router ports**: forward **80/tcp** and **443/tcp** to that box (Caddy
-   needs 80 for the Let's Encrypt HTTP-01 challenge).
-3. **Edit files** so the three values match:
-   - `Caddyfile` → replace `your-hostname.tld` with your hostname.
-   - `.env` → set `SPOTIFY_REDIRECT_HOST=<your-host>`
-     (the relay's `SPOTIFY_REDIRECT_URI` is built as
-     `https://<your-host>/callback`).
-   - Spotify dashboard → add the **same** `https://<your-host>/callback`.
-4. **Run**:
+1. **Reverse proxy** (nginx, Caddy, Traefik, Apache, a cloud proxy, …) → new
+   rule / location:
+   - Protocol: `https` (or terminate TLS with a valid cert on the host)
+   - Host name: `your-public.hostname`
+   - URI:      `/lyrics`   (no trailing slash)
+   - Server:   `127.0.0.1`
+   - Port:     `8899`
+   - (Optional) add header `Host: relay:8899` if you want the relay to see
+     the container name.
+
+2. **Spotify dashboard** → redirect URI (exactly one):
+   ```
+   https://your-public.hostname/lyrics/callback
+   ```
+
+3. **On the host** (in the folder holding this repo):
    ```bash
    cp .env.example .env
-   # fill SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET / SPOTIFY_REDIRECT_HOST
-   docker compose up -d
-   docker compose logs -f caddy     # first start obtains the certificate
+   # edit .env:
+   #   SPOTIFY_CLIENT_ID=...
+   #   SPOTIFY_CLIENT_SECRET=...
+   # .env already has:
+   #   SPOTIFY_REDIRECT_URI=https://your-public.hostname/lyrics/callback
+   #   RELAY_BASE_PATH=/lyrics
+   docker compose up -d --build
    docker compose logs -f relay
    ```
-5. **Log in**: open `https://<your-host>/login` in a browser, authorize, and
-   the callback lands on `.../callback`. Done.
-6. **From the car / LAN**: `curl -s https://<your-host>/status | jq`.
+
+4. **Log in**: open `https://your-public.hostname/lyrics/login` in a browser,
+   authorize; Spotify redirects to `.../callback` and the tokens are saved to
+   the `data/` volume.
+
+5. **From any client** (car, dashboard, HA, …):
+   ```bash
+   curl -s https://your-public.hostname/lyrics/status | jq
+   ```
+
+> **Notes**
+>
+> - If the proxy already holds a valid certificate for the host, no Let's
+>   Encrypt re-run and no port 80 needed for the challenge.
+> - If you ever need to change the base path (e.g. from `/lyrics` to
+>   `/spotify`), keep the proxy rule, `RELAY_BASE_PATH` and the Spotify
+>   redirect URI all in sync; the relay has no fallback.
+> - The `data/` directory is the token store — do not delete it between
+>   upgrades or you will have to log in again.
 
 ## Security
 
 - The process runs as a non-root user (`relay`) inside the container.
 - Tokens are stored in a mounted volume (`data/`), not in the image.
 - The image contains **no** secrets (runtime environment only).
-- If you expose the relay beyond your LAN, put TLS behind a reverse proxy and
-  add your own authentication in front of `/status`.
+- The relay binds to `127.0.0.1:8899` on the host only; the public surface is
+  whatever your reverse proxy exposes. Add authentication in front of
+  `/status` if you plan to expose it beyond the LAN.
 
 ## License
 

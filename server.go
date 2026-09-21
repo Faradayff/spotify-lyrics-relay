@@ -12,12 +12,14 @@ import (
 type relayServer struct {
 	spot   *spotifyClient
 	lyrics *lyricsClient
+	base   string
 }
 
-func newRelayServer() *relayServer {
+func newRelayServer(base string) *relayServer {
 	return &relayServer{
 		spot:   newSpotifyClient(),
 		lyrics: newLyricsClient(),
+		base:   base,
 	}
 }
 
@@ -29,7 +31,7 @@ func (s *relayServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 	if !s.spot.authorized() {
 		writeJSON(w, http.StatusOK, map[string]any{
-			"ok": false, "auth": false, "error": "spotify not authenticated; open /login from a browser",
+			"ok": false, "auth": false, "error": "spotify not authenticated; open the base path from a browser and click log in",
 		})
 		return
 	}
@@ -178,13 +180,13 @@ func (s *relayServer) handleCallback(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprint(w, `<!doctype html><html><head><meta charset="utf-8"></head><body style="background:#0d0d0d;color:#e8e8e8;font-family:monospace;padding:24px;">
 <h3>OK, session saved</h3>
-<p>The car app can now consume <code>/status</code>. You can close this window.</p>
+<p>The car app can now consume <code>GET status</code> on the same base path. You can close this window.</p>
 </body></html>`)
 }
 
 func (s *relayServer) handleLogout(w http.ResponseWriter, r *http.Request) {
 	s.spot.logout()
-	http.Redirect(w, r, "/", http.StatusFound)
+	http.Redirect(w, r, s.base+"/", http.StatusFound)
 }
 
 func (s *relayServer) handleControl(w http.ResponseWriter, r *http.Request) {
@@ -231,9 +233,9 @@ a{color:#1db954} code{background:#1a1a1a;padding:1px 4px}</style>
 <h3>lyrics-relay</h3>
 <div class="box">
   <b>Spotify</b>: %s<br>
-  <b>Actions</b>: <a href="/login">log in</a> &middot; <a href="/logout">log out</a><br>
-  <b>Car app</b>: <code>GET /status</code> (JSON, CORS open)<br>
-  <b>Controls</b>: <code>POST /control?action=next|prev|pause|resume</code>
+  <b>Actions</b>: <a href="login">log in</a> &middot; <a href="logout">log out</a><br>
+  <b>Car app</b>: <code>GET status</code> (JSON, CORS open)<br>
+  <b>Controls</b>: <code>POST control?action=next|prev|pause|resume</code>
 </div>
 </body></html>
 `, status)

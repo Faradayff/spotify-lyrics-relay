@@ -11,6 +11,8 @@ tokens.json
 # binaries / build output
 *.exe
 relay
+lyrics-relay
+spotify-lyrics-relay
 *.test
 vendor/
 
