@@ -212,7 +212,7 @@ reverse proxy"* below for the exact rule.
 ```yaml
 services:
   relay:
-    image: ghcr.io/yourusername/spotify-lyrics-relay:latest
+    image: ghcr.io/faradayff/spotify-lyrics-relay:latest
     container_name: spotify-lyrics-relay
     restart: unless-stopped
     ports:

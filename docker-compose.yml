@@ -1,7 +1,7 @@
 services:
   relay:
     build: .
-    image: ghcr.io/youruser/spotify-lyrics-relay:latest
+    image: ghcr.io/faradayff/spotify-lyrics-relay:latest
     container_name: spotify-lyrics-relay
     restart: unless-stopped
     # Only loopback traffic reaches port 8899 — nothing forwarded to the router.
