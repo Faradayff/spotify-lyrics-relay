@@ -239,6 +239,32 @@ services:
 Keep `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` in `.env` (next to the
 compose file), not in the image or a committed file.
 
+### Option B2 — dedicated subdomain (root path)
+
+If you would rather keep the relay on its own subdomain instead of a path
+(e.g. `lyrics.your-domain.com`), point the whole proxy rule at the relay's
+root and leave the base path empty:
+
+```yaml
+    environment:
+      - SPOTIFY_REDIRECT_URI=https://lyrics.your-domain.com/callback
+      - RELAY_BASE_PATH=
+```
+
+Proxy rule: `https://lyrics.your-domain.com/*` → `http://127.0.0.1:8899/*`
+(the proxy must forward the URI *as-is*; the relay then serves `/login`,
+`/status`, `/control`, `/callback` at the root).
+
+| | Option B (path) | Option B2 (subdomain) |
+|---|---|---|
+| Login | `https://host/lyrics/login` | `https://lyrics.host/login` |
+| Callback (Spotify dashboard) | `https://host/lyrics/callback` | `https://lyrics.host/callback` |
+| JSON API | `https://host/lyrics/status` | `https://lyrics.host/status` |
+| `RELAY_BASE_PATH` | `/lyrics` | *(empty)* |
+
+Both modes run the same container; only `RELAY_BASE_PATH` and the registered
+redirect URI differ. Pick one — the relay serves only the configured base.
+
 ## Running without Docker
 
 ```bash
