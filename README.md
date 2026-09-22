@@ -46,6 +46,7 @@ GET /status   →   200 JSON
   "track": { "id":"...", "name":"...", "artist":"...", "album":"...", "uri":"..." },
   "lyricsSynced": true,
   "lyricsLines": 42,
+  "lyricsStatus": "synced",
   "line": 7,
   "lineText": "Is this the real life?",
   "nextLines": [ { "t": 45000, "text": "Is this just fantasy?" }, { "t": 50000, "text": "..." } ],
@@ -53,15 +54,15 @@ GET /status   →   200 JSON
 }
 ```
 
-- `lineText` is the exact line to display right now (zero-based `line` is its
-  index, resolved by binary search over the timestamped lines).
-- `nextLines` are the **next 3 lines** after the active one (fewer near the
-  end of the song) — enough for a karaoke-style readout: current line large,
-  the rest below.
-- `lines` is the full timestamped list (`t` = ms into the track) for scrolling
-  or animation; it is stable per track, safe to cache.
-- When `lyricsSynced` is `false` only plain lyrics exist: they are returned
-  as a single `plain` string (no `line`/`lines`).
+- `lyricsStatus` tells you exactly which UI to render — always present when
+  `ok && auth`:
+  - `"synced"` — timestamped lyrics: `lineText` (current line, big on screen),
+    `nextLines` (next 3, below), `lines` (full list for scrolling; stable per
+    track, safe to cache).
+  - `"plain"` — only unsynced text exists: one `plain` string, shown as a
+    single block (no per-line sync possible).
+  - `"none"` — no lyrics found for this track: render your own
+    "no lyrics" / "letra no disponible" placeholder.
 - When not authenticated: `{ "ok": false, "auth": false, "error": "..." }`.
 
 ### Other endpoints
@@ -83,14 +84,22 @@ curl -s http://localhost:8899/status | jq -r .lineText
 ```
 
 ```js
-// In any JS/TS frontend — karaoke-style render
+// In any JS/TS frontend — pick the UI from lyricsStatus
 const s = await fetch("http://relay.local:8899/status").then(r => r.json());
-if (s.ok && s.lyricsSynced) {
-  renderCurrent(s.lineText);                 // big, on screen
-  renderUpcoming(s.nextLines);               // next 3 lines (fewer at the end)
+if (s.ok && s.auth) {
+  switch (s.lyricsStatus) {
+    case "synced":
+      renderCurrent(s.lineText);                  // big, on screen
+      renderUpcoming(s.nextLines);                // next 3 lines below
+      break;
+    case "plain":
+      renderPlain(s.plain);                       // single unsynced block
+      break;
+    case "none":
+      renderPlaceholder("Letra no disponible");
+      break;
+  }
 }
-// s.lines = [{t, text}, ...] → full scroll / animation
-// s.plain  → unsynced songs only (no s.line, no s.lines)
 ```
 
 ## Features

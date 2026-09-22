@@ -66,6 +66,7 @@ func (s *relayServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"track":        ti,
 		"lyricsSynced": lyrSynced,
 		"lyricsLines":  lyrCount,
+		"lyricsStatus": lyricsStatus(lyrData, lineIdx),
 	}
 	for k, v := range lyricPayload(lyrData, lineIdx) {
 		resp[k] = v
@@ -120,6 +121,21 @@ func lyricPayload(data *lyricsData, idx int) map[string]any {
 		out["plain"] = data.Plain
 	}
 	return out
+}
+
+// lyricsStatus tells the client which lyric mode applies, so it can render
+// one of three UIs unambiguously:
+//   - "synced": timestamped lines are present (line/lineText/nextLines/lines)
+//   - "plain":  only plain text is available (single "plain" field)
+//   - "none":   no lyrics found for this track at all — show "no lyrics"
+func lyricsStatus(data *lyricsData, idx int) string {
+	if data != nil && data.Synced && idx >= 0 && len(data.Lines) > 0 {
+		return "synced"
+	}
+	if data != nil && data.Plain != "" {
+		return "plain"
+	}
+	return "none"
 }
 
 // karaokeWindow is how many upcoming lines are sent after the active one.

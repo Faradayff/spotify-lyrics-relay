@@ -169,3 +169,25 @@ func TestLyricPayload(t *testing.T) {
 		t.Fatalf("empty data should yield empty payload: %+v", p)
 	}
 }
+
+func TestLyricsStatus(t *testing.T) {
+	synced := &lyricsData{Synced: true, Lines: []lyricLine{{T: 0, Text: "a"}}, LinesCount: 1}
+	plain := &lyricsData{Synced: false, Plain: "hello"}
+
+	if got := lyricsStatus(synced, 0); got != "synced" {
+		t.Fatalf("want synced, got %q", got)
+	}
+	// Synced data wins even when plain text also exists for the same track.
+	if got := lyricsStatus(&lyricsData{Synced: true, Lines: []lyricLine{{T: 0, Text: "a"}}, Plain: "hello"}, 0); got != "synced" {
+		t.Fatalf("want synced (plain present), got %q", got)
+	}
+	if got := lyricsStatus(plain, -1); got != "plain" {
+		t.Fatalf("want plain, got %q", got)
+	}
+	if got := lyricsStatus(nil, -1); got != "none" {
+		t.Fatalf("want none, got %q", got)
+	}
+	if got := lyricsStatus(&lyricsData{}, -1); got != "none" {
+		t.Fatalf("want none for empty data, got %q", got)
+	}
+}
