@@ -49,7 +49,13 @@ func (s *relayServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	position := intOr(st["progress_ms"])
 
 	ti := buildTrackInfo(s.lyrics, trackRaw)
-	lineIdx, lyrSynced, lyrCount, lyrErr := s.lyricsFor(ti, position)
+	lyrData, lineIdx, lyrErr := s.lyricsFor(ti, position)
+
+	lyrSynced := lyrData != nil && lyrData.Synced
+	lyrCount := 0
+	if lyrData != nil {
+		lyrCount = lyrData.LinesCount
+	}
 
 	resp := map[string]any{
 		"ok":           true,
@@ -61,18 +67,18 @@ func (s *relayServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"lyricsSynced": lyrSynced,
 		"lyricsLines":  lyrCount,
 	}
+	for k, v := range lyricPayload(lyrData, lineIdx) {
+		resp[k] = v
+	}
 	if lyrErr != nil {
 		resp["error"] = lyrErr.Error()
-	}
-	if lineIdx >= 0 {
-		resp["line"] = lineIdx
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
 
-func (s *relayServer) lyricsFor(ti *trackInfo, estMs int) (int, bool, int, error) {
+func (s *relayServer) lyricsFor(ti *trackInfo, estMs int) (*lyricsData, int, error) {
 	if ti == nil || ti.ID == "" {
-		return -1, false, 0, nil
+		return nil, -1, nil
 	}
 	track := map[string]any{
 		"id":          ti.ID,
@@ -85,16 +91,30 @@ func (s *relayServer) lyricsFor(ti *trackInfo, estMs int) (int, bool, int, error
 	}
 	data, err := s.lyrics.getForTrack(track)
 	if err != nil {
-		return -1, false, 0, err
+		return nil, -1, err
 	}
-	if data == nil || (!data.Synced && data.Plain == "") {
-		return -1, false, 0, nil
+	if data == nil || !data.Synced || len(data.Lines) == 0 {
+		return data, -1, nil
 	}
-	if !data.Synced {
-		return -1, false, 0, nil
+	return data, findLine(data.Lines, estMs), nil
+}
+
+// lyricPayload builds the lyric fields appended to /status: the active line
+// (index + text) and the full timestamped line list, or the plain
+// (unsynced) text when that is the only version available.
+func lyricPayload(data *lyricsData, idx int) map[string]any {
+	out := map[string]any{}
+	if data == nil {
+		return out
 	}
-	idx := findLine(data.Lines, estMs)
-	return idx, true, len(data.Lines), nil
+	if data.Synced && idx >= 0 && idx < len(data.Lines) {
+		out["line"] = idx
+		out["lineText"] = data.Lines[idx].Text
+		out["lines"] = data.Lines
+	} else if !data.Synced && data.Plain != "" {
+		out["plain"] = data.Plain
+	}
+	return out
 }
 
 func findLine(lines []lyricLine, ms int) int {

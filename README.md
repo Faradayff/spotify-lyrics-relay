@@ -46,13 +46,18 @@ GET /status   →   200 JSON
   "track": { "id":"...", "name":"...", "artist":"...", "album":"...", "uri":"..." },
   "lyricsSynced": true,
   "lyricsLines": 42,
-  "line": 7
+  "line": 7,
+  "lineText": "Is this the real life?",
+  "lines": [ { "t": 40000, "text": "Is this the real life?" }, { "t": 45000, "text": "..." } ]
 }
 ```
 
-- `line` is the zero-based index of the line that should currently be shown,
-  resolved by binary search over the timestamped lyric lines.
-- `lyricsSynced` is `false` when only plain (unsynced) lyrics are available.
+- `lineText` is the exact line to display right now (zero-based `line` is its
+  index, resolved by binary search over the timestamped lines).
+- `lines` is the full timestamped list (`t` = ms into the track) so a client
+  can show context lines or animate; it is stable per track, safe to cache.
+- When `lyricsSynced` is `false` only plain lyrics exist: they are returned
+  as a single `plain` string (no `line`/`lines`).
 - When not authenticated: `{ "ok": false, "auth": false, "error": "..." }`.
 
 ### Other endpoints
@@ -69,14 +74,16 @@ GET /status   →   200 JSON
 ### Example use in an automation
 
 ```bash
-# Which line should the display show right now?
-curl -s http://localhost:8899/status | jq -r .line
+# What text should the display show right now?
+curl -s http://localhost:8899/status | jq -r .lineText
 ```
 
 ```js
 // In any JS/TS frontend
 const s = await fetch("http://relay.local:8899/status").then(r => r.json());
-if (s.ok && s.lyricsSynced) renderLine(s.line);
+if (s.ok && s.lyricsSynced) renderLine(s.lineText);   // exact current line
+// s.lines = [{t, text}, ...] → context / karaoke-style scrolling
+// s.plain  → unsynced songs only (no s.line, no s.lines)
 ```
 
 ## Features

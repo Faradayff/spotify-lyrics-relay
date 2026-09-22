@@ -117,3 +117,41 @@ func TestTrackFromState_ItemAndTrack(t *testing.T) {
 		t.Fatalf("nil state must yield nil track")
 	}
 }
+
+func TestLyricPayload(t *testing.T) {
+	lines := []lyricLine{{T: 40000, Text: "Is this the real life?"}, {T: 45000, Text: "Is this just fantasy?"}}
+	synced := &lyricsData{Synced: true, Lines: lines, LinesCount: 2}
+
+	// Synced data: active line index + text + full line list.
+	p := lyricPayload(synced, 0)
+	if p["line"] != 0 || p["lineText"] != "Is this the real life?" {
+		t.Fatalf("active line wrong: %+v", p)
+	}
+	all, ok := p["lines"].([]lyricLine)
+	if !ok || len(all) != 2 || all[1].Text != "Is this just fantasy?" {
+		t.Fatalf("full lines missing: %+v", p)
+	}
+
+	// Out-of-range index: nothing leaked, no crash.
+	if p := lyricPayload(synced, 99); len(p) != 0 {
+		t.Fatalf("out-of-range idx should yield empty payload: %+v", p)
+	}
+
+	// Unsynced: only the plain text is exposed.
+	plain := &lyricsData{Synced: false, Plain: "full lyrics, no stamps"}
+	p2 := lyricPayload(plain, -1)
+	if p2["plain"] != "full lyrics, no stamps" {
+		t.Fatalf("plain missing: %+v", p2)
+	}
+	if _, ok := p2["line"]; ok {
+		t.Fatalf("no line fields expected for plain-only lyrics")
+	}
+
+	// No data at all: empty payload.
+	if p := lyricPayload(nil, -1); len(p) != 0 {
+		t.Fatalf("nil data should yield empty payload: %+v", p)
+	}
+	if p := lyricPayload(&lyricsData{}, -1); len(p) != 0 {
+		t.Fatalf("empty data should yield empty payload: %+v", p)
+	}
+}
