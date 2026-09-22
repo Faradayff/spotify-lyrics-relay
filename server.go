@@ -100,8 +100,8 @@ func (s *relayServer) lyricsFor(ti *trackInfo, estMs int) (*lyricsData, int, err
 }
 
 // lyricPayload builds the lyric fields appended to /status: the active line
-// (index + text) and the full timestamped line list, or the plain
-// (unsynced) text when that is the only version available.
+// (index + text), the upcoming karaoke window and the full timestamped line
+// list, or the plain (unsynced) text when that is the only version available.
 func lyricPayload(data *lyricsData, idx int) map[string]any {
 	out := map[string]any{}
 	if data == nil {
@@ -111,11 +111,19 @@ func lyricPayload(data *lyricsData, idx int) map[string]any {
 		out["line"] = idx
 		out["lineText"] = data.Lines[idx].Text
 		out["lines"] = data.Lines
+		end := idx + 1 + karaokeWindow
+		if end > len(data.Lines) {
+			end = len(data.Lines)
+		}
+		out["nextLines"] = data.Lines[idx+1 : end]
 	} else if !data.Synced && data.Plain != "" {
 		out["plain"] = data.Plain
 	}
 	return out
 }
+
+// karaokeWindow is how many upcoming lines are sent after the active one.
+const karaokeWindow = 3
 
 func findLine(lines []lyricLine, ms int) int {
 	if len(lines) == 0 {

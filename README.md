@@ -48,14 +48,18 @@ GET /status   →   200 JSON
   "lyricsLines": 42,
   "line": 7,
   "lineText": "Is this the real life?",
+  "nextLines": [ { "t": 45000, "text": "Is this just fantasy?" }, { "t": 50000, "text": "..." } ],
   "lines": [ { "t": 40000, "text": "Is this the real life?" }, { "t": 45000, "text": "..." } ]
 }
 ```
 
 - `lineText` is the exact line to display right now (zero-based `line` is its
   index, resolved by binary search over the timestamped lines).
-- `lines` is the full timestamped list (`t` = ms into the track) so a client
-  can show context lines or animate; it is stable per track, safe to cache.
+- `nextLines` are the **next 3 lines** after the active one (fewer near the
+  end of the song) — enough for a karaoke-style readout: current line large,
+  the rest below.
+- `lines` is the full timestamped list (`t` = ms into the track) for scrolling
+  or animation; it is stable per track, safe to cache.
 - When `lyricsSynced` is `false` only plain lyrics exist: they are returned
   as a single `plain` string (no `line`/`lines`).
 - When not authenticated: `{ "ok": false, "auth": false, "error": "..." }`.
@@ -79,10 +83,13 @@ curl -s http://localhost:8899/status | jq -r .lineText
 ```
 
 ```js
-// In any JS/TS frontend
+// In any JS/TS frontend — karaoke-style render
 const s = await fetch("http://relay.local:8899/status").then(r => r.json());
-if (s.ok && s.lyricsSynced) renderLine(s.lineText);   // exact current line
-// s.lines = [{t, text}, ...] → context / karaoke-style scrolling
+if (s.ok && s.lyricsSynced) {
+  renderCurrent(s.lineText);                 // big, on screen
+  renderUpcoming(s.nextLines);               // next 3 lines (fewer at the end)
+}
+// s.lines = [{t, text}, ...] → full scroll / animation
 // s.plain  → unsynced songs only (no s.line, no s.lines)
 ```
 

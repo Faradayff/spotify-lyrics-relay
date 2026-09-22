@@ -119,17 +119,31 @@ func TestTrackFromState_ItemAndTrack(t *testing.T) {
 }
 
 func TestLyricPayload(t *testing.T) {
-	lines := []lyricLine{{T: 40000, Text: "Is this the real life?"}, {T: 45000, Text: "Is this just fantasy?"}}
-	synced := &lyricsData{Synced: true, Lines: lines, LinesCount: 2}
+	lines := []lyricLine{
+		{T: 40000, Text: "one"}, {T: 45000, Text: "two"}, {T: 50000, Text: "three"},
+		{T: 55000, Text: "four"}, {T: 60000, Text: "five"}, {T: 65000, Text: "six"},
+	}
+	synced := &lyricsData{Synced: true, Lines: lines, LinesCount: 6}
 
-	// Synced data: active line index + text + full line list.
-	p := lyricPayload(synced, 0)
-	if p["line"] != 0 || p["lineText"] != "Is this the real life?" {
+	// Synced data: active line + next three + full list.
+	p := lyricPayload(synced, 2)
+	if p["line"] != 2 || p["lineText"] != "three" {
 		t.Fatalf("active line wrong: %+v", p)
 	}
 	all, ok := p["lines"].([]lyricLine)
-	if !ok || len(all) != 2 || all[1].Text != "Is this just fantasy?" {
+	if !ok || len(all) != 6 || all[5].Text != "six" {
 		t.Fatalf("full lines missing: %+v", p)
+	}
+	next, ok := p["nextLines"].([]lyricLine)
+	if !ok || len(next) != 3 || next[0].Text != "four" || next[2].Text != "six" {
+		t.Fatalf("nextLines wrong (want four/five/six): %+v", p)
+	}
+
+	// At the last line: window must be empty, not padded or panicking.
+	last := lyricPayload(synced, 5)
+	next, _ = last["nextLines"].([]lyricLine)
+	if len(next) != 0 {
+		t.Fatalf("expected empty nextLines at end, got: %+v", next)
 	}
 
 	// Out-of-range index: nothing leaked, no crash.
