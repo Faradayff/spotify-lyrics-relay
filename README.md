@@ -50,9 +50,15 @@ GET /status   →   200 JSON
   "line": 7,
   "lineText": "Is this the real life?",
   "nextLines": [ { "t": 45000, "text": "Is this just fantasy?" }, { "t": 50000, "text": "..." } ],
-  "lines": [ { "t": 40000, "text": "Is this the real life?" }, { "t": 45000, "text": "..." } ]
+  "lines": [ { "t": 40000, "text": "Is this the real life?" }, { "t": 45000, "text": "..." } ],
+  "version": 42
 }
 ```
+
+`version` is a monotonically increasing integer that only bumps when the
+*visible* state changes (track, playing state, active lyric line, lyrics
+mode, auth/error). It does **not** bump on `positionMs` or `updated` churn.
+Use the presence of `version` as feature detection for wait mode (below).
 
 - `lyricsStatus` tells you exactly which UI to render — always present when
   `ok && auth`:
@@ -64,6 +70,51 @@ GET /status   →   200 JSON
   - `"none"` — no lyrics found for this track: render your own
     "no lyrics" / "letra no disponible" placeholder.
 - When not authenticated: `{ "ok": false, "auth": false, "error": "..." }`.
+
+### Wait mode (long-poll)
+
+Instead of polling `/status` every few hundred milliseconds, a client can hold
+a request open and have the relay answer **the moment the visible state
+changes** (or when a timeout elapses). Best for slow clients (car head units,
+kiosks): one request per lyric line instead of several per second, and zero
+CPU while waiting.
+
+| Param | Meaning |
+|---|---|
+| `wait` | `1` = hold the response until the state changes or the timeout elapses. Absent/other = answer immediately. |
+| `timeoutMs` | Max hold time in ms. Clamped to **1000..15000** (default 8000). Keep ≤ 15 s so a reverse proxy does not 504 the held request. |
+| `sinceVersion` | Last `version` the client already saw. Absent or `-1` → answer immediately with the current state (this is how a new client's first request is answered, with zero wait). |
+
+Example:
+
+```bash
+# answer immediately (client has never seen the state)
+curl -s "http://relay.local:8899/status?wait=1&timeoutMs=8000&sinceVersion=-1"
+
+# hold until the lyric line / playing state / track changes, then answer:
+curl -s "http://relay.local:8899/status?wait=1&timeoutMs=8000&sinceVersion=42"
+```
+
+Guarantees:
+
+- the answer is always a normal `200` JSON body with a `version` field — the
+  client cannot (and should not have to) distinguish "changed" from
+  "timed out"; it just issues the next wait request;
+- if `sinceVersion` is in the past (below the current version), the answer is
+  immediate;
+- multiple clients may wait simultaneously; a single state change wakes all
+  of them;
+- a client that disconnects while held frees its resources immediately
+  (no goroutine leak);
+- `wait=1` goes through exactly the same auth requirements as a plain request
+  (e.g. Basic Auth at the reverse proxy still applies);
+- old clients (no `wait` params) are completely unaffected; new clients
+  automatically fall back to classic polling when the response has no
+  `version` (old relay). No coordinated release needed.
+
+Client pacing suggestion (the Android app does this): on a fast return
+(same version, < 3 s) the relay is clearly not holding — pace yourself
+(~1 s) to avoid hot-looping a misconfigured relay.
 
 ### Other endpoints
 
@@ -206,6 +257,7 @@ user-read-playback-state user-read-currently-playing streaming
 | `RELAY_BASE_PATH` | no | Base path all routes are served under (e.g. `/lyrics`); empty for `http://127.0.0.1:8899/...`. Must be a prefix of `SPOTIFY_REDIRECT_URI`. |
 | `RELAY_ADDR` | no | Listen address, defaults to `:8899` |
 | `STATE_DIR` | no | Token storage dir (defaults to `/data` inside the container) |
+| `RELAY_WAITS_REFRESH_MS` | no | How often the relay re-checks Spotify while clients are holding a `wait=1` request. Default `300` (ms), clamped to a 100 ms floor. The relay performs **no** Spotify calls while nobody is waiting. |
 
 ## Running with Docker
 

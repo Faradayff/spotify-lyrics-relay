@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -12,6 +13,7 @@ import (
 type relayServer struct {
 	spot   *spotifyClient
 	lyrics *lyricsClient
+	hub    *statusHub
 	base   string
 }
 
@@ -19,28 +21,78 @@ func newRelayServer(base string) *relayServer {
 	return &relayServer{
 		spot:   newSpotifyClient(),
 		lyrics: newLyricsClient(),
+		hub:    newStatusHub(),
 		base:   base,
 	}
 }
 
 // --- /status (the only route the car app consumes) ---
 
+// handleStatus serves GET /status in two modes:
+//   - plain (no wait param, or wait != "1"): compute fresh, publish, answer now
+//     (identical behavior and body to pre-wait-mode relays, plus "version");
+//   - wait mode (wait=1): hold the response until the visible fingerprint
+//     changes past sinceVersion, timeoutMs elapses, or the client disconnects.
 func (s *relayServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Cache-Control", "no-store")
 
-	if !s.spot.authorized() {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"ok": false, "auth": false, "error": "spotify not authenticated; open the base path from a browser and click log in",
-		})
+	if r.URL.Query().Get("wait") != "1" {
+		s.hub.publish(s.computeStatusPayload())
+		s.writeStatus(w)
 		return
+	}
+
+	since, err := strconv.ParseInt(r.URL.Query().Get("sinceVersion"), 10, 64)
+	if err != nil || since <= 0 {
+		// Client's state is unknown (first request): answer immediately with
+		// a fresh computation, so the first answer costs zero wait time.
+		s.hub.publish(s.computeStatusPayload())
+		s.writeStatus(w)
+		return
+	}
+
+	ch, v := s.hub.changedAndVersion()
+	if v > since {
+		s.writeStatus(w) // already changed: fast path
+		return
+	}
+
+	s.hub.addWaiter()
+	defer s.hub.dropWaiter()
+
+	timer := time.NewTimer(waitTimeout(r.URL.Query().Get("timeoutMs")))
+	defer timer.Stop()
+
+	select {
+	case <-ch: // fingerprint changed past everything the client already saw
+	case <-timer.C: // backstop: answer with the current (unchanged) state
+	case <-r.Context().Done(): // client went away: bail without answering
+		return
+	}
+	s.writeStatus(w)
+}
+
+// writeStatus answers with the hub's current snapshot plus the version.
+func (s *relayServer) writeStatus(w http.ResponseWriter) {
+	p, v := s.hub.response()
+	p["version"] = v
+	writeJSON(w, http.StatusOK, p)
+}
+
+// computeStatusPayload builds the /status body (without "version") by
+// querying the current playback state and resolving the lyrics.
+func (s *relayServer) computeStatusPayload() map[string]any {
+	if !s.spot.authorized() {
+		return map[string]any{
+			"ok": false, "auth": false, "error": "spotify not authenticated; open the base path from a browser and click log in",
+		}
 	}
 	st, err := s.spot.mePlayer()
 	if err != nil {
-		writeJSON(w, http.StatusOK, map[string]any{
+		return map[string]any{
 			"ok": false, "auth": true, "error": err.Error(),
-		})
-		return
+		}
 	}
 
 	now := time.Now()
@@ -57,7 +109,7 @@ func (s *relayServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 		lyrCount = lyrData.LinesCount
 	}
 
-	resp := map[string]any{
+	payload := map[string]any{
 		"ok":           true,
 		"auth":         true,
 		"playing":      isPlaying,
@@ -69,12 +121,12 @@ func (s *relayServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"lyricsStatus": lyricsStatus(lyrData, lineIdx),
 	}
 	for k, v := range lyricPayload(lyrData, lineIdx) {
-		resp[k] = v
+		payload[k] = v
 	}
 	if lyrErr != nil {
-		resp["error"] = lyrErr.Error()
+		payload["error"] = lyrErr.Error()
 	}
-	writeJSON(w, http.StatusOK, resp)
+	return payload
 }
 
 func (s *relayServer) lyricsFor(ti *trackInfo, estMs int) (*lyricsData, int, error) {

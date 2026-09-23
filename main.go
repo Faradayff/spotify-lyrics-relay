@@ -4,6 +4,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -38,6 +39,8 @@ func run(addr string) error {
 	mux.HandleFunc(base+"/status", srv.handleStatus)
 	mux.HandleFunc("POST "+base+"/control", srv.handleControl)
 
+	go srv.runRefreshLoop(refreshInterval())
+
 	s := &http.Server{
 		Addr:              addr,
 		Handler:           mux,
@@ -45,6 +48,18 @@ func run(addr string) error {
 	}
 	log.Printf("relay listening on %s (base path %q)", addr, base)
 	return s.ListenAndServe()
+}
+
+// refreshInterval is the wait-mode state refresh cadence. Default 300 ms
+// (the same pace the app used for classic polling); override with
+// RELAY_WAITS_REFRESH_MS, clamped to a 100 ms floor.
+func refreshInterval() time.Duration {
+	if v := os.Getenv("RELAY_WAITS_REFRESH_MS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 100 {
+			return time.Duration(n) * time.Millisecond
+		}
+	}
+	return 300 * time.Millisecond
 }
 
 func env(key, def string) string {
