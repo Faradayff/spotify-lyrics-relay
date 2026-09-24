@@ -38,17 +38,50 @@ func TestParseLRC_Sorting(t *testing.T) {
 
 func TestFindLine(t *testing.T) {
 	lines := parseLRC("[00:00.00]a\n[00:10.00]b\n[00:20.00]c")
-	// at 5s -> closest is 0 (a)
+	// at 5s -> a is still active (b only starts at 10s)
 	if i := findLine(lines, 5000); i != 0 {
 		t.Fatalf("5s expected 0 got %d", i)
 	}
-	// at 12s -> closest is 10 (b)
+	// at 12s -> b started at 10s and is active (c starts at 20s)
 	if i := findLine(lines, 12000); i != 1 {
 		t.Fatalf("12s expected 1 got %d", i)
 	}
 	// at 25s -> clamps to last (c)
 	if i := findLine(lines, 25000); i != 2 {
 		t.Fatalf("25s expected 2 got %d", i)
+	}
+}
+
+// TestFindLine_SparseGaps is the Bohemian Rhapsody regression: long phrases
+// with big gaps between them. The active line must stay put until the NEXT
+// line actually starts (its timestamp), not at the midpoint between lines —
+// with a 14.8s gap the old midpoint logic jumped 7.3s before the audio.
+func TestFindLine_SparseGaps(t *testing.T) {
+	lines := parseLRC("[00:00.15]Is this the real life?\n[00:14.80]Caught in a landslide")
+	// 7s = old (buggy) switch point, well before the 14.8s audio start
+	if i := findLine(lines, 7000); i != 0 {
+		t.Fatalf("7s expected 0 (first line still active) got %d", i)
+	}
+	// 14s < 14.8s: still the first line
+	if i := findLine(lines, 14000); i != 0 {
+		t.Fatalf("14s expected 0 got %d", i)
+	}
+	// exactly at the start of line 1 -> it becomes active
+	if i := findLine(lines, 14800); i != 1 {
+		t.Fatalf("14.8s expected 1 got %d", i)
+	}
+	// after the last line -> stays on the last
+	if i := findLine(lines, 60000); i != 1 {
+		t.Fatalf("60s expected 1 got %d", i)
+	}
+}
+
+// TestFindLine_BeforeFirstLine: position before the first timestamp must
+// show the first line, never -1.
+func TestFindLine_BeforeFirstLine(t *testing.T) {
+	lines := parseLRC("[00:05.00]first\n[00:30.00]second")
+	if i := findLine(lines, 1000); i != 0 {
+		t.Fatalf("1s (before first line) expected 0 got %d", i)
 	}
 }
 

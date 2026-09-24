@@ -193,20 +193,25 @@ func lyricsStatus(data *lyricsData, idx int) string {
 // karaokeWindow is how many upcoming lines are sent after the active one.
 const karaokeWindow = 3
 
+// findLine returns the active lyric line at time ms: the most recently
+// STARTED line, i.e. the last one whose timestamp is <= ms. A line stays
+// active until the next line actually begins, so sparse sections (long
+// phrases with big gaps, e.g. Bohemian Rhapsody) keep the current line on
+// screen for its full duration instead of jumping ahead at the midpoint.
+// Positions before the first line show the first line; after the last one,
+// the last one stays.
 func findLine(lines []lyricLine, ms int) int {
 	if len(lines) == 0 {
 		return -1
 	}
 	idx := sort.Search(len(lines), func(i int) bool { return lines[i].T > int64(ms) })
+	if idx == 0 {
+		return 0 // before the first line starts: show the first
+	}
 	if idx == len(lines) {
-		idx = len(lines) - 1
+		return len(lines) - 1 // after the last line: keep the last
 	}
-	if idx > 0 {
-		if int64(ms)-lines[idx-1].T <= lines[idx].T-int64(ms) {
-			idx--
-		}
-	}
-	return idx
+	return idx - 1
 }
 
 func buildTrackInfo(lc *lyricsClient, raw map[string]any) *trackInfo {
