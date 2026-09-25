@@ -129,7 +129,11 @@ func fingerprint(p map[string]any) string {
 	b.WriteString("|")
 	b.WriteString(strconv.FormatBool(boolOr(get("playing"))))
 	b.WriteString("|")
-	if ti, ok := get("track").(*trackInfo); ok {
+	// "track" may hold a typed-nil *trackInfo (payload["track"] = nil pointer)
+	// when Spotify reports no active track; a bare "ok" assertion does not
+	// catch that, and dereferencing it would panic out of the HTTP handler
+	// and kill the whole relay (502 loop behind the proxy).
+	if ti, ok := get("track").(*trackInfo); ok && ti != nil {
 		b.WriteString(ti.ID)
 	}
 	b.WriteString("|")

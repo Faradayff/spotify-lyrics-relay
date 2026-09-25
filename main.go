@@ -41,9 +41,13 @@ func run(addr string) error {
 
 	go srv.runRefreshLoop(refreshInterval())
 
+	// A panic anywhere in a handler must never take the whole process down:
+	// net/http does not recover handler panics, and on the relay the cost of
+	// one bad payload shape is a dead container + a 502 storm for every client
+	// (including the car). Answer 500 and stay up instead.
 	s := &http.Server{
 		Addr:              addr,
-		Handler:           mux,
+		Handler:           recoverPanics(mux),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	log.Printf("relay listening on %s (base path %q)", addr, base)
@@ -67,4 +71,19 @@ func env(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// recoverPanics wraps the mux so a handler panic returns 500 instead of
+// tearing the process down (an unrecovered panic in net/http kills the whole
+// server: one bad request = dead relay = 502 storm for every client).
+func recoverPanics(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				log.Printf("panic serving %s %s: %v", r.Method, r.URL.Path, rec)
+				http.Error(w, "internal error", http.StatusInternalServerError)
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
 }

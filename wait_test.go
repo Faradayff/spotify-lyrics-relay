@@ -98,6 +98,34 @@ func TestFingerprintDetectsEveryVisibleChange(t *testing.T) {
 	}
 }
 
+// A payload whose "track" field carries a typed-nil *trackInfo (what
+// computeStatusPayload stores when Spotify has no active track) must NOT
+// panic the fingerprint — and must fingerprint identically to a payload
+// where the track is absent. Regression: this used to dereference the nil
+// pointer out of the /status handler and crash the whole relay (502 storm).
+func TestFingerprintTypedNilTrackDoesNotPanic(t *testing.T) {
+	var nilTrack *trackInfo
+	var withNil, without string
+	didPanic := false
+	func() {
+		defer func() {
+			if recover() != nil {
+				didPanic = true
+			}
+		}()
+		withNil = fingerprint(basePayload(map[string]any{"track": nilTrack}))
+		without = fingerprint(basePayload(map[string]any{"track": nil}))
+		// publish() is the code path reached from the request handler.
+		newStatusHub().publish(basePayload(map[string]any{"track": nilTrack}))
+	}()
+	if didPanic {
+		t.Fatal("fingerprint must not panic on a typed-nil track")
+	}
+	if withNil != without {
+		t.Fatalf("typed-nil track and absent track must fingerprint identically:\n%q\n%q", withNil, without)
+	}
+}
+
 // --- hub: version bump + wakeup ---
 
 func TestHubNoBumpWhenFingerprintUnchanged(t *testing.T) {
