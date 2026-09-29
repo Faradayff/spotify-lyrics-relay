@@ -302,24 +302,66 @@ func (s *relayServer) handleControl(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "action": action})
 }
 
+// handleHealthz is a dependency-free liveness probe: it reports that the
+// process is serving and whether a Spotify session exists, without calling
+// Spotify or the lyrics API. It must always answer fast, because it backs
+// the container health-check that runs on a 5 s budget. Always 200 (liveness,
+// not readiness): a relay with no session is still a healthy process — the
+// operator just needs a browser to log in.
+func (s *relayServer) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":   true,
+		"auth": s.spot.authorized(),
+	})
+}
+
+// indexStateTimeout caps how long the index page waits on the Spotify API
+// for its "playing/paused/status" line. mePlayer carries a 20 s client
+// timeout; holding a request that long (or whatever is polling this route)
+// for a status page is worse than a neutral "still loading" line.
+const indexStateTimeout = 3 * time.Second
+
+// indexStatus builds the Spotify line without being able to block the
+// response for the full Spotify timeout: the API call runs in the
+// background, and after indexStateTimeout we answer with a neutral status
+// anyway (the call keeps running and simply stops being waited on; the
+// buffered channel guarantees it can always write its result and exit).
+func (s *relayServer) indexStatus(r *http.Request) string {
+	type state struct {
+		st  map[string]any
+		err error
+	}
+	ch := make(chan state, 1)
+	go func() {
+		st, err := s.spot.mePlayer()
+		ch <- state{st: st, err: err}
+	}()
+	select {
+	case res := <-ch:
+		if res.err != nil {
+			return "authenticated (error reading state)"
+		}
+		trackName, _ := trackFromState(res.st)["name"].(string)
+		if trackName == "" {
+			return "authenticated, no track"
+		}
+		if playing, _ := res.st["is_playing"].(bool); playing {
+			return "playing: " + trackName
+		}
+		return "paused: " + trackName
+	case <-time.After(indexStateTimeout):
+		return "authenticated (state loading…)"
+	case <-r.Context().Done():
+		return "authenticated (state cancelled)"
+	}
+}
+
 func (s *relayServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	authorized := s.spot.authorized()
-	status, trackName := "no session", ""
-	if authorized {
-		if st, err := s.spot.mePlayer(); err == nil {
-			trackName, _ = trackFromState(st)["name"].(string)
-			playing, _ := st["is_playing"].(bool)
-			if trackName == "" {
-				status = "authenticated, no track"
-			} else if playing {
-				status = "playing: " + trackName
-			} else {
-				status = "paused: " + trackName
-			}
-		} else {
-			status = "authenticated (error reading state)"
-		}
+	status := "no session"
+	if s.spot.authorized() {
+		status = s.indexStatus(r)
 	}
 	fmt.Fprintf(w, `<!doctype html>
 <html><head><meta charset="utf-8"><title>lyrics-relay</title>

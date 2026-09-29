@@ -39,6 +39,14 @@ func run(addr string) error {
 	mux.HandleFunc(base+"/status", srv.handleStatus)
 	mux.HandleFunc("POST "+base+"/control", srv.handleControl)
 
+	// Liveness probe, always served at the root so container health-checks
+	// work regardless of RELAY_BASE_PATH, plus under the base path when one
+	// is set. Registering the same pattern twice would panic ServeMux.
+	mux.HandleFunc("/healthz", srv.handleHealthz)
+	if base != "" {
+		mux.HandleFunc(base+"/healthz", srv.handleHealthz)
+	}
+
 	go srv.runRefreshLoop(refreshInterval())
 
 	// A panic anywhere in a handler must never take the whole process down:

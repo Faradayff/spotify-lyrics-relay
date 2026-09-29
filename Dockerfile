@@ -21,6 +21,8 @@ RUN mkdir -p /data && chown relay:relay /data
 ENV STATE_DIR=/data
 USER relay
 EXPOSE 8899
+# Liveness probe: /healthz never calls out to Spotify, so it stays fast
+# (a 5 s budget is plenty) regardless of RELAY_BASE_PATH.
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-  CMD wget -q --spider http://127.0.0.1:8899/ || exit 1
+  CMD wget -q --spider http://127.0.0.1:8899/healthz || exit 1
 ENTRYPOINT ["/usr/local/bin/relay"]

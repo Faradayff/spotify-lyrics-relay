@@ -259,6 +259,16 @@ user-read-playback-state user-read-currently-playing streaming
 | `STATE_DIR` | no | Token storage dir (defaults to `/data` inside the container) |
 | `RELAY_WAITS_REFRESH_MS` | no | How often the relay re-checks Spotify while clients are holding a `wait=1` request. Default `300` (ms), clamped to a 100 ms floor. The relay performs **no** Spotify calls while nobody is waiting. |
 
+## Health checks
+
+`GET /healthz` (and `/lyrics/healthz` when `RELAY_BASE_PATH=/lyrics`) is a
+dependency-free liveness probe: it answers `200 {"ok": true, "auth": …}`
+immediately, without calling Spotify or the lyrics API. Point container
+health-checks — Docker `HEALTHCHECK`, Synology Container Manager, a reverse
+proxy monitor, etc. — at it rather than at `/status` or the index page, which
+depend on the Spotify API and can outlive a short health-check budget (a
+timeout there would mark a perfectly healthy relay as failing).
+
 ## Running with Docker
 
 ### Option A — local development on any machine

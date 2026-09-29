@@ -17,8 +17,10 @@ services:
       - STATE_DIR=/data
     volumes:
       - ./data:/data
+    # /healthz is dependency-free (no Spotify call) and always at the root,
+    # so it works with or without RELAY_BASE_PATH.
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8899/lyrics/"]
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8899/healthz"]
       interval: 30s
       timeout: 5s
       retries: 3
