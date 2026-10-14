@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -15,6 +16,13 @@ type relayServer struct {
 	lyrics *lyricsClient
 	hub    *statusHub
 	base   string
+
+	// delayMs is the audio-delay compensation (ms) the client most recently
+	// requested via the /status query. The wait-mode refresh loop re-reads it
+	// so every published snapshot applies the same shift the app asked for.
+	// Single-tenant: the last request wins. 0 = no delay.
+	delayMu sync.Mutex
+	delayMs int64
 }
 
 func newRelayServer(base string) *relayServer {
@@ -24,6 +32,39 @@ func newRelayServer(base string) *relayServer {
 		hub:    newStatusHub(),
 		base:   base,
 	}
+}
+
+// delayMsMax caps the client-requested compensation. 30 s is plenty for a car
+// audio chain — the same ceiling the app's settings expose.
+const delayMsMax = 30000
+
+// parseDelayMs validates the client-supplied delayMs query parameter: absent
+// or invalid means "no delay" (0), a negative value is rejected, and anything
+// above the ceiling is clamped down.
+func parseDelayMs(raw string) int64 {
+	if raw == "" {
+		return 0
+	}
+	n, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || n < 0 {
+		return 0
+	}
+	if n > delayMsMax {
+		n = delayMsMax
+	}
+	return n
+}
+
+func (s *relayServer) setDelay(ms int64) {
+	s.delayMu.Lock()
+	s.delayMs = ms
+	s.delayMu.Unlock()
+}
+
+func (s *relayServer) delay() int64 {
+	s.delayMu.Lock()
+	defer s.delayMu.Unlock()
+	return s.delayMs
 }
 
 // --- /status (the only route the car app consumes) ---
@@ -37,31 +78,40 @@ func (s *relayServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Cache-Control", "no-store")
 
-	if r.URL.Query().Get("wait") != "1" {
+	q := r.URL.Query()
+	// Apply the client's audio-delay compensation from this request onward;
+	// the wait-mode refresh loop keeps using it for this client. A client that
+	// sends the parameter is a new app that renders the relay's line directly,
+	// so the full "lines" array is trimmed out of its response (old clients
+	// never send it and keep receiving it for their local re-derivation).
+	s.setDelay(parseDelayMs(q.Get("delayMs")))
+	trim := q.Get("delayMs") != ""
+
+	if q.Get("wait") != "1" {
 		s.hub.publish(s.computeStatusPayload())
-		s.writeStatus(w)
+		s.writeStatus(w, trim)
 		return
 	}
 
-	since, err := strconv.ParseInt(r.URL.Query().Get("sinceVersion"), 10, 64)
+	since, err := strconv.ParseInt(q.Get("sinceVersion"), 10, 64)
 	if err != nil || since <= 0 {
 		// Client's state is unknown (first request): answer immediately with
 		// a fresh computation, so the first answer costs zero wait time.
 		s.hub.publish(s.computeStatusPayload())
-		s.writeStatus(w)
+		s.writeStatus(w, trim)
 		return
 	}
 
 	ch, v := s.hub.changedAndVersion()
 	if v > since {
-		s.writeStatus(w) // already changed: fast path
+		s.writeStatus(w, trim) // already changed: fast path
 		return
 	}
 
 	s.hub.addWaiter()
 	defer s.hub.dropWaiter()
 
-	timer := time.NewTimer(waitTimeout(r.URL.Query().Get("timeoutMs")))
+	timer := time.NewTimer(waitTimeout(q.Get("timeoutMs")))
 	defer timer.Stop()
 
 	select {
@@ -70,28 +120,37 @@ func (s *relayServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	case <-r.Context().Done(): // client went away: bail without answering
 		return
 	}
-	s.writeStatus(w)
+	s.writeStatus(w, trim)
 }
 
 // writeStatus answers with the hub's current snapshot plus the version.
-func (s *relayServer) writeStatus(w http.ResponseWriter) {
+// For new clients (trimLines) the full "lines" array is dropped from the
+// served copy so the app skips re-parsing ~50 objects per response; the
+// shared snapshot itself is never mutated.
+func (s *relayServer) writeStatus(w http.ResponseWriter, trimLines bool) {
 	p, v := s.hub.response()
 	p["version"] = v
+	if trimLines {
+		delete(p, "lines")
+	}
 	writeJSON(w, http.StatusOK, p)
 }
 
 // computeStatusPayload builds the /status body (without "version") by
-// querying the current playback state and resolving the lyrics.
+// querying the current playback state and resolving the lyrics, applying the
+// client's audio-delay compensation to the active line.
 func (s *relayServer) computeStatusPayload() map[string]any {
+	delay := s.delay()
 	if !s.spot.authorized() {
 		return map[string]any{
-			"ok": false, "auth": false, "error": "spotify not authenticated; open the base path from a browser and click log in",
+			"ok": false, "auth": false, "delayMs": delay,
+			"error": "spotify not authenticated; open the base path from a browser and click log in",
 		}
 	}
 	st, err := s.spot.mePlayer()
 	if err != nil {
 		return map[string]any{
-			"ok": false, "auth": true, "error": err.Error(),
+			"ok": false, "auth": true, "delayMs": delay, "error": err.Error(),
 		}
 	}
 
@@ -101,7 +160,9 @@ func (s *relayServer) computeStatusPayload() map[string]any {
 	position := intOr(st["progress_ms"])
 
 	ti := buildTrackInfo(s.lyrics, trackRaw)
-	lyrData, lineIdx, lyrErr := s.lyricsFor(ti, position)
+	// Resolve the active line at position - delay so the line the app renders
+	// is the one the listener hears now (the head unit plays ~delay late).
+	lyrData, lineIdx, lyrErr := s.lyricsFor(ti, position-int(delay))
 
 	lyrSynced := lyrData != nil && lyrData.Synced
 	lyrCount := 0
@@ -116,6 +177,7 @@ func (s *relayServer) computeStatusPayload() map[string]any {
 		"positionMs":   position,
 		"updated":      now.UTC().Format(time.RFC3339),
 		"track":        ti,
+		"delayMs":      delay,
 		"lyricsSynced": lyrSynced,
 		"lyricsLines":  lyrCount,
 		"lyricsStatus": lyricsStatus(lyrData, lineIdx),
@@ -163,6 +225,13 @@ func lyricPayload(data *lyricsData, idx int) map[string]any {
 	if data.Synced && idx >= 0 && idx < len(data.Lines) {
 		out["line"] = idx
 		out["lineText"] = data.Lines[idx].Text
+		// The line above the active one, so the app can render a karaoke band
+		// without carrying (and re-parsing) the full "lines" array.
+		prev := ""
+		if idx > 0 {
+			prev = data.Lines[idx-1].Text
+		}
+		out["prevLine"] = prev
 		out["lines"] = data.Lines
 		end := idx + 1 + karaokeWindow
 		if end > len(data.Lines) {

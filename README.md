@@ -47,10 +47,12 @@ GET /status   →   200 JSON
   "lyricsSynced": true,
   "lyricsLines": 42,
   "lyricsStatus": "synced",
-  "line": 7,
-  "lineText": "Is this the real life?",
-  "nextLines": [ { "t": 45000, "text": "Is this just fantasy?" }, { "t": 50000, "text": "..." } ],
-  "lines": [ { "t": 40000, "text": "Is this the real life?" }, { "t": 45000, "text": "..." } ],
+  "line": 6,
+  "lineText": "Is this just fantasy?",
+  "prevLine": "Is this the real life?",
+  "nextLines": [ { "t": 45000, "text": "Caught in a landslide" }, { "t": 50000, "text": "..." } ],
+  "lines": [ { "t": 40000, "text": "Is this the real life?" }, { "t": 42000, "text": "Is this just fantasy?" }, { "t": 45000, "text": "Caught in a landslide" } ],
+  "delayMs": 1200,
   "version": 42
 }
 ```
@@ -59,6 +61,18 @@ GET /status   →   200 JSON
 *visible* state changes (track, playing state, active lyric line, lyrics
 mode, auth/error). It does **not** bump on `positionMs` or `updated` churn.
 Use the presence of `version` as feature detection for wait mode (below).
+
+`delayMs` is the **audio-delay compensation** the client requested, echoed
+back on every answer (its presence is the feature detection, mirroring
+`version`). When a client sends `delayMs=N` on the request, the relay resolves
+`line` / `lineText` / `prevLine` / `nextLines` at `positionMs − N`, so the line
+it serves is the one the listener is actually hearing now (e.g. a car audio
+chain that plays ~1.2 s late). Absent or invalid → `0`. The value is
+single-tenant "last request wins": the wait-mode refresh loop keeps applying
+the delay the client most recently sent. New clients (those that send the
+parameter) also get the full `lines` array **omitted** from the response —
+they render the served line directly and don't need it; older clients that
+never send the parameter keep receiving `lines` for their local re-derivation.
 
 - `lyricsStatus` tells you exactly which UI to render — always present when
   `ok && auth`:
@@ -84,6 +98,7 @@ CPU while waiting.
 | `wait` | `1` = hold the response until the state changes or the timeout elapses. Absent/other = answer immediately. |
 | `timeoutMs` | Max hold time in ms. Clamped to **1000..15000** (default 8000). Keep ≤ 15 s so a reverse proxy does not 504 the held request. |
 | `sinceVersion` | Last `version` the client already saw. Absent or `-1` → answer immediately with the current state (this is how a new client's first request is answered, with zero wait). |
+| `delayMs` | Audio-delay compensation in ms (0–30000). The relay resolves the active line at `positionMs − delayMs`, echoes it back, and omits the full `lines` array for clients that send it. Absent/invalid → `0` + `lines` kept. |
 
 Example:
 

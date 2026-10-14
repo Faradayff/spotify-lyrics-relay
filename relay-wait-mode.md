@@ -146,6 +146,44 @@ Basic Auth at the proxy). Consequences for the implementation:
 So the new client is safe to deploy before the relay, and the new relay is
 safe to deploy before the client. No coordinated release needed.
 
+### 6. Audio-delay compensation (the `delayMs` parameter)
+
+The head unit's audio chain plays the song a little late, so the lyrics
+(driven by the true playback position) run ahead of what is heard. The client
+asks the relay to resolve the active line at `positionMs − delayMs` instead of
+re-deriving it locally — moving the delay off the slow screen and, as a
+consequence, making the wait-mode `version` bump exactly when the *heard* line
+changes (the app-side delay used to shift the visible line at a different
+wall-clock instant than the relay's fingerprint, so updates arrived late and
+batched).
+
+| Param | Meaning |
+|---|---|
+| `delayMs` | Audio-delay compensation in ms. Clamped to **0..30000**; absent/invalid → `0`. |
+
+Rules:
+
+- The relay **echoes** `"delayMs": <applied int>` in **every** `/status`
+  response (present = feature detection, mirroring `version`); the app only
+  trusts the relay's line when it sees it.
+- `line` / `lineText` / `prevLine` / `nextLines` are resolved at
+  `positionMs − delayMs` (positions before the first line keep the first line).
+- **`prevLine`** — the text of the line above the active one (`""` at the
+  first line), always present in synced mode — lets the app render the karaoke
+  band without the full `lines` array.
+- **Payload trim:** a client that *sends* `delayMs` gets the full `lines`
+  array omitted from that response (it renders the served line directly).
+  Clients that never send the parameter keep receiving `lines` for their local
+  re-derivation.
+- The delay is single-tenant **last request wins**; the wait-mode refresh loop
+  keeps applying the last value the client sent so held responses and
+  `version` bumps all reflect it.
+
+| client \ relay | without `delayMs` (old) | with `delayMs` (new) |
+|---|---|---|
+| **old client** (sends no `delayMs`) | as today; relays without the field behave as before | no param → `delayMs` echoed as `0`, `lines` still present; client re-derives locally |
+| **new client** (always sends `delayMs`) | no `delayMs` echoed → the client **falls back to local re-derivation** (the behavior the app ships today) | relay applies the delay; `lines` omitted; the app renders the served line + `prevLine` directly |
+
 ## What the client does (for joint debugging)
 
 - Every request carries `?wait=1&timeoutMs=8000&sinceVersion=N` (N starts at
@@ -268,6 +306,13 @@ Run against a locally running relay (replace `HOST` / credentials):
    (`/debug/pprof/goroutine` or a `len` of a waiter registry).
 9. **Concurrency**: two clients waiting, one state change → both return.
 10. **Timeout clamp**: `timeoutMs=100000` → held at most 15 s.
+    **Delay echo**: `curl -u USER:PASS -s "http://HOST/status?delayMs=1500"`
+    → body includes `"delayMs": 1500`; and the active line is the one at
+    `positionMs − 1500` (with a `delayMs=0` or absent request the relay's
+    unshifted line is served and `"delayMs": 0`).
+    **Trim**: the same `delayMs=1500` response has **no** `lines` array but
+    keeps `prevLine` / `lineText` / `nextLines`; a request without the param
+    still carries `lines`.
 11. **Through the real reverse proxy**: the setup the app actually uses
     (port 80 vhost + Basic Auth) must deliver the held response without a
     504 within the 15 s clamp.
