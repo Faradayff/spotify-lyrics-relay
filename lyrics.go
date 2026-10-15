@@ -16,6 +16,10 @@ import (
 const (
 	lrclibBase = "https://lrclib.net/api"
 	cacheTTL   = 7 * 24 * time.Hour
+	// errorCacheTTL: how long a failed provider fetch (429/5xx) is replayed
+	// from the cache instead of being re-requested. Long enough to ride out a
+	// rate-limit window, short enough to retry soon.
+	errorCacheTTL = 60 * time.Second
 )
 
 type lyricLine struct {
@@ -30,21 +34,34 @@ type lyricsData struct {
 	LinesCount int         `json:"linesCount,omitempty"`
 }
 
+// cacheEntry holds either a successful lookup (data) or a provider failure
+// (err) so the wait-mode refresh loop can replay it for a short window
+// instead of hammering the upstream again on every 300 ms tick.
 type cacheEntry struct {
 	at   time.Time
 	data lyricsData
+	err  error
 }
 
 type lyricsClient struct {
 	mu    sync.Mutex
+	base  string
 	cache map[string]cacheEntry
-	http  *http.Client
+	// inflight marks keys a fetch is already running for, so a concurrent
+	// tick (or app + curl at once) skips its own request instead of
+	// duplicating it.
+	inflight map[string]struct{}
+	errTTL   time.Duration
+	http     *http.Client
 }
 
 func newLyricsClient() *lyricsClient {
 	return &lyricsClient{
-		cache: map[string]cacheEntry{},
-		http:  &http.Client{Timeout: 20 * time.Second},
+		base:     lrclibBase,
+		cache:    map[string]cacheEntry{},
+		inflight: map[string]struct{}{},
+		errTTL:   errorCacheTTL,
+		http:     &http.Client{Timeout: 20 * time.Second},
 	}
 }
 
@@ -139,7 +156,7 @@ func (l *lyricsClient) fetch(track map[string]any) (map[string]any, error) {
 	if durMs > 0 {
 		q.Set("duration", strconv.Itoa(durMs/1000))
 	}
-	u := lrclibBase + "/get?" + q.Encode()
+	u := l.base + "/get?" + q.Encode()
 	req, err := http.NewRequest("GET", u, nil)
 	if err != nil {
 		return nil, err
@@ -197,19 +214,40 @@ func (l *lyricsClient) getForTrack(track map[string]any) (*lyricsData, error) {
 	}
 	key := fmt.Sprintf("%v", track["id"]) + "|" + l.artistName(track)
 	l.mu.Lock()
-	if e, ok := l.cache[key]; ok && time.Since(e.at) < cacheTTL {
-		l.mu.Unlock()
-		return &e.data, nil
+	if e, ok := l.cache[key]; ok {
+		age := time.Since(e.at)
+		if e.err != nil && age < l.errTTL {
+			// Replay the recent provider failure without re-requesting it:
+			// the wait-mode loop recomputes every 300 ms, and without this
+			// each tick re-rains LRCLIB during a 429 window.
+			l.mu.Unlock()
+			return nil, e.err
+		}
+		if e.err == nil && age < cacheTTL {
+			l.mu.Unlock()
+			return &e.data, nil
+		}
 	}
+	if _, busy := l.inflight[key]; busy {
+		// Another caller is already resolving this key: skip this tick
+		// (the payload simply has no lyrics for those few hundred ms)
+		// and let the next tick retry instead of stacking a duplicate
+		// request on the provider.
+		l.mu.Unlock()
+		return nil, nil
+	}
+	l.inflight[key] = struct{}{}
 	l.mu.Unlock()
+	defer func() {
+		l.mu.Lock()
+		delete(l.inflight, key)
+		l.mu.Unlock()
+	}()
 
 	m, err := l.fetch(track)
-	if err != nil {
-		return nil, err
-	}
 	out := decodeLyrics(m)
 	l.mu.Lock()
-	l.cache[key] = cacheEntry{at: time.Now(), data: out}
+	l.cache[key] = cacheEntry{at: time.Now(), data: out, err: err}
 	l.mu.Unlock()
-	return &out, nil
+	return &out, err
 }

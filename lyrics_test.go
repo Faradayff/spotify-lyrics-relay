@@ -1,6 +1,11 @@
 package main
 
-import "testing"
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+)
 
 func TestParseLRC_Basic(t *testing.T) {
 	lrc := "[00:12.00]Line one\n[00:15.500]Line two\n[00:20]Line three"
@@ -200,6 +205,132 @@ func TestLyricPayload(t *testing.T) {
 	}
 	if p := lyricPayload(&lyricsData{}, -1); len(p) != 0 {
 		t.Fatalf("empty data should yield empty payload: %+v", p)
+	}
+}
+
+// newTestLyricsClient points the cached client at a fake provider so the
+// tests can count exactly how many upstream requests a sequence of lookups
+// produces.
+func newTestLyricsClient(base string, errTTL time.Duration) *lyricsClient {
+	return &lyricsClient{
+		base:     base,
+		cache:    map[string]cacheEntry{},
+		inflight: map[string]struct{}{},
+		errTTL:   errTTL,
+		http:     &http.Client{Timeout: 2 * time.Second},
+	}
+}
+
+func songTrack() map[string]any {
+	return map[string]any{"id": "track-1", "name": "Song", "artist": "Band"}
+}
+
+// A provider failure (LRCLIB 429) must be replayed from the cache for the
+// error window — a second lookup of the same track may not re-hit the
+// upstream while the first caller is still waiting on it.
+func TestGetForTrack_CachesProviderFailures(t *testing.T) {
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"message":"Too many requests"}`))
+	}))
+	defer srv.Close()
+
+	l := newTestLyricsClient(srv.URL, time.Minute)
+	tr := songTrack()
+	if _, err := l.getForTrack(tr); err == nil {
+		t.Fatal("expected an error for a 429 provider")
+	}
+	if _, err := l.getForTrack(tr); err == nil {
+		t.Fatal("expected the cached error to be replayed")
+	}
+	if hits != 1 {
+		t.Fatalf("provider hit %d times, want 1", hits)
+	}
+}
+
+// A successful lookup stays cached (existing behaviour kept): the second
+// lookup must not contact the provider at all.
+func TestGetForTrack_CachesSuccess(t *testing.T) {
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		_, _ = w.Write([]byte(`{"syncedLyrics":"[00:01.00]one","plainLyrics":"one"}`))
+	}))
+	defer srv.Close()
+
+	l := newTestLyricsClient(srv.URL, time.Minute)
+	tr := songTrack()
+	d1, err := l.getForTrack(tr)
+	if err != nil || d1 == nil || !d1.Synced {
+		t.Fatalf("first fetch failed: %v %+v", err, d1)
+	}
+	if d2, err := l.getForTrack(tr); err != nil || d2 == nil || !d2.Synced {
+		t.Fatalf("second fetch failed: %v %+v", err, d2)
+	}
+	if hits != 1 {
+		t.Fatalf("provider hit %d times, want 1", hits)
+	}
+}
+
+// A concurrent lookup of the same key (two 300 ms refresh ticks, or app +
+// curl at once) must not duplicate the upstream request: the second caller
+// skips this tick and the provider sees exactly one hit.
+func TestGetForTrack_SkipsInflightConcurrentFetch(t *testing.T) {
+	release := make(chan struct{})
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		<-release // hold the request open until the test lets it through
+	}))
+	defer srv.Close()
+
+	l := newTestLyricsClient(srv.URL, time.Minute)
+	tr := songTrack()
+	done := make(chan struct{})
+	go func() {
+		l.getForTrack(tr)
+		close(done)
+	}()
+
+	// Wait until the first request is actually in flight.
+	deadline := time.Now().Add(2 * time.Second)
+	for hits == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	// While the first fetch is in flight, a second lookup of the same key
+	// must skip the provider for this tick.
+	if d, err := l.getForTrack(tr); err != nil || d != nil {
+		t.Fatalf("in-flight duplicate should give (nil, nil), got %v %v", d, err)
+	}
+	close(release)
+	<-done
+	if hits != 1 {
+		t.Fatalf("provider hit %d times, want 1", hits)
+	}
+}
+
+// Once the error window expires the lookup retries the provider.
+func TestGetForTrack_RetriesAfterErrorTTL(t *testing.T) {
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+
+	l := newTestLyricsClient(srv.URL, 30*time.Millisecond)
+	tr := songTrack()
+	if _, err := l.getForTrack(tr); err == nil {
+		t.Fatal("expected an error")
+	}
+	time.Sleep(60 * time.Millisecond) // let the error window expire
+	if _, err := l.getForTrack(tr); err == nil {
+		t.Fatal("expected an error after the retry")
+	}
+	if hits != 2 {
+		t.Fatalf("provider hit %d times, want 2", hits)
 	}
 }
 
