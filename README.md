@@ -51,7 +51,6 @@ GET /status   →   200 JSON
   "lineText": "Is this just fantasy?",
   "prevLine": "Is this the real life?",
   "nextLines": [ { "t": 45000, "text": "Caught in a landslide" }, { "t": 50000, "text": "..." } ],
-  "lines": [ { "t": 40000, "text": "Is this the real life?" }, { "t": 42000, "text": "Is this just fantasy?" }, { "t": 45000, "text": "Caught in a landslide" } ],
   "delayMs": 1200,
   "version": 42
 }
@@ -69,16 +68,14 @@ back on every answer (its presence is the feature detection, mirroring
 it serves is the one the listener is actually hearing now (e.g. a car audio
 chain that plays ~1.2 s late). Absent or invalid → `0`. The value is
 single-tenant "last request wins": the wait-mode refresh loop keeps applying
-the delay the client most recently sent. New clients (those that send the
-parameter) also get the full `lines` array **omitted** from the response —
-they render the served line directly and don't need it; older clients that
-never send the parameter keep receiving `lines` for their local re-derivation.
+the delay the client most recently sent. The full `lines` array is **never
+served**: clients render the relay's `line` / `prevLine` / `nextLines`
+directly, so what a `curl` shows is exactly what the app renders.
 
 - `lyricsStatus` tells you exactly which UI to render — always present when
   `ok && auth`:
   - `"synced"` — timestamped lyrics: `lineText` (current line, big on screen),
-    `nextLines` (next 3, below), `lines` (full list for scrolling; stable per
-    track, safe to cache).
+    `prevLine` (the line above), `nextLines` (next 3, below).
   - `"plain"` — only unsynced text exists: one `plain` string, shown as a
     single block (no per-line sync possible).
   - `"none"` — no lyrics found for this track: render your own
@@ -98,7 +95,7 @@ CPU while waiting.
 | `wait` | `1` = hold the response until the state changes or the timeout elapses. Absent/other = answer immediately. |
 | `timeoutMs` | Max hold time in ms. Clamped to **1000..15000** (default 8000). Keep ≤ 15 s so a reverse proxy does not 504 the held request. |
 | `sinceVersion` | Last `version` the client already saw. Absent or `-1` → answer immediately with the current state (this is how a new client's first request is answered, with zero wait). |
-| `delayMs` | Audio-delay compensation in ms (0–30000). The relay resolves the active line at `positionMs − delayMs`, echoes it back, and omits the full `lines` array for clients that send it. Absent/invalid → `0` + `lines` kept. |
+| `delayMs` | Audio-delay compensation in ms (0–30000). The relay resolves the active line at `positionMs − delayMs` and echoes it back. Absent/invalid → `0`. |
 
 Example:
 

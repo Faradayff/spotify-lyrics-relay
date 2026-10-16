@@ -43,7 +43,7 @@ no new headers, no new auth. Old clients are untouched.
   "lyricsSynced": true, "lyricsLines": 54,
   "line": 16,
   "lineText": "…",
-  "lines": [ { "t": 6000, "text": "…" }, … ],
+  "prevLine": "…",
   "nextLines": [ … ],
   "version": 42
 }
@@ -164,25 +164,23 @@ batched).
 Rules:
 
 - The relay **echoes** `"delayMs": <applied int>` in **every** `/status`
-  response (present = feature detection, mirroring `version`); the app only
-  trusts the relay's line when it sees it.
+  response, so a plain `curl` shows the delay actually in effect.
 - `line` / `lineText` / `prevLine` / `nextLines` are resolved at
   `positionMs − delayMs` (positions before the first line keep the first line).
 - **`prevLine`** — the text of the line above the active one (`""` at the
   first line), always present in synced mode — lets the app render the karaoke
   band without the full `lines` array.
-- **Payload trim:** a client that *sends* `delayMs` gets the full `lines`
-  array omitted from that response (it renders the served line directly).
-  Clients that never send the parameter keep receiving `lines` for their local
-  re-derivation.
+- The full `lines` array is **never served**: clients render the relay's
+  `line` / `prevLine` / `nextLines` directly, so what a `curl` shows is
+  exactly what the app renders.
 - The delay is single-tenant **last request wins**; the wait-mode refresh loop
   keeps applying the last value the client sent so held responses and
   `version` bumps all reflect it.
 
-| client \ relay | without `delayMs` (old) | with `delayMs` (new) |
-|---|---|---|
-| **old client** (sends no `delayMs`) | as today; relays without the field behave as before | no param → `delayMs` echoed as `0`, `lines` still present; client re-derives locally |
-| **new client** (always sends `delayMs`) | no `delayMs` echoed → the client **falls back to local re-derivation** (the behavior the app ships today) | relay applies the delay; `lines` omitted; the app renders the served line + `prevLine` directly |
+There is a **single contract**: the relay applies the delay the client sends
+(or `0`) and serves the resolved `line` / `prevLine` / `nextLines` without
+the full `lines` array. Relays that predate the delay parameter are no longer
+a supported mode for the app — it renders exactly what the relay serves.
 
 ## What the client does (for joint debugging)
 
@@ -310,9 +308,9 @@ Run against a locally running relay (replace `HOST` / credentials):
     → body includes `"delayMs": 1500`; and the active line is the one at
     `positionMs − 1500` (with a `delayMs=0` or absent request the relay's
     unshifted line is served and `"delayMs": 0`).
-    **Trim**: the same `delayMs=1500` response has **no** `lines` array but
-    keeps `prevLine` / `lineText` / `nextLines`; a request without the param
-    still carries `lines`.
+    **Reduced payload**: every `/status` response (with or without the
+    param) has **no** `lines` array but keeps `line` / `lineText` /
+    `prevLine` / `nextLines`.
 11. **Through the real reverse proxy**: the setup the app actually uses
     (port 80 vhost + Basic Auth) must deliver the held response without a
     504 within the 15 s clamp.

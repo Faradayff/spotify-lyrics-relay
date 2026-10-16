@@ -163,14 +163,17 @@ func TestLyricPayload(t *testing.T) {
 	}
 	synced := &lyricsData{Synced: true, Lines: lines, LinesCount: 6}
 
-	// Synced data: active line + next three + full list.
+	// Synced data: active line + the line above + next three; the full list
+	// is intentionally not part of the served payload.
 	p := lyricPayload(synced, 2)
 	if p["line"] != 2 || p["lineText"] != "three" {
 		t.Fatalf("active line wrong: %+v", p)
 	}
-	all, ok := p["lines"].([]lyricLine)
-	if !ok || len(all) != 6 || all[5].Text != "six" {
-		t.Fatalf("full lines missing: %+v", p)
+	if p["prevLine"] != "two" {
+		t.Fatalf("prevLine missing or wrong: %+v", p)
+	}
+	if _, ok := p["lines"]; ok {
+		t.Fatalf("full lines must not be served: %+v", p)
 	}
 	next, ok := p["nextLines"].([]lyricLine)
 	if !ok || len(next) != 3 || next[0].Text != "four" || next[2].Text != "six" {

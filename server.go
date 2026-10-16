@@ -80,16 +80,13 @@ func (s *relayServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 	q := r.URL.Query()
 	// Apply the client's audio-delay compensation from this request onward;
-	// the wait-mode refresh loop keeps using it for this client. A client that
-	// sends the parameter is a new app that renders the relay's line directly,
-	// so the full "lines" array is trimmed out of its response (old clients
-	// never send it and keep receiving it for their local re-derivation).
+	// the wait-mode refresh loop keeps using it for this client. Single-tenant:
+	// the last request wins (0 = no delay).
 	s.setDelay(parseDelayMs(q.Get("delayMs")))
-	trim := q.Get("delayMs") != ""
 
 	if q.Get("wait") != "1" {
 		s.hub.publish(s.computeStatusPayload())
-		s.writeStatus(w, trim)
+		s.writeStatus(w)
 		return
 	}
 
@@ -98,13 +95,13 @@ func (s *relayServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 		// Client's state is unknown (first request): answer immediately with
 		// a fresh computation, so the first answer costs zero wait time.
 		s.hub.publish(s.computeStatusPayload())
-		s.writeStatus(w, trim)
+		s.writeStatus(w)
 		return
 	}
 
 	ch, v := s.hub.changedAndVersion()
 	if v > since {
-		s.writeStatus(w, trim) // already changed: fast path
+		s.writeStatus(w) // already changed: fast path
 		return
 	}
 
@@ -120,19 +117,13 @@ func (s *relayServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	case <-r.Context().Done(): // client went away: bail without answering
 		return
 	}
-	s.writeStatus(w, trim)
+	s.writeStatus(w)
 }
 
 // writeStatus answers with the hub's current snapshot plus the version.
-// For new clients (trimLines) the full "lines" array is dropped from the
-// served copy so the app skips re-parsing ~50 objects per response; the
-// shared snapshot itself is never mutated.
-func (s *relayServer) writeStatus(w http.ResponseWriter, trimLines bool) {
+func (s *relayServer) writeStatus(w http.ResponseWriter) {
 	p, v := s.hub.response()
 	p["version"] = v
-	if trimLines {
-		delete(p, "lines")
-	}
 	writeJSON(w, http.StatusOK, p)
 }
 
@@ -215,8 +206,10 @@ func (s *relayServer) lyricsFor(ti *trackInfo, estMs int) (*lyricsData, int, err
 }
 
 // lyricPayload builds the lyric fields appended to /status: the active line
-// (index + text), the upcoming karaoke window and the full timestamped line
-// list, or the plain (unsynced) text when that is the only version available.
+// (index + text), the line above it, and the upcoming karaoke window, or the
+// plain (unsynced) text when that is the only version available. The full
+// timestamped line list is never served: clients render the served line
+// directly, so the response stays small for the weakest screens.
 func lyricPayload(data *lyricsData, idx int) map[string]any {
 	out := map[string]any{}
 	if data == nil {
@@ -232,7 +225,6 @@ func lyricPayload(data *lyricsData, idx int) map[string]any {
 			prev = data.Lines[idx-1].Text
 		}
 		out["prevLine"] = prev
-		out["lines"] = data.Lines
 		end := idx + 1 + karaokeWindow
 		if end > len(data.Lines) {
 			end = len(data.Lines)

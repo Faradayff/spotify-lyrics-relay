@@ -1,8 +1,6 @@
 package main
 
 import (
-	"net/http/httptest"
-	"strings"
 	"testing"
 )
 
@@ -60,34 +58,6 @@ func TestPlainStatusEchoesZeroDelayMs(t *testing.T) {
 	i, ok := v.(float64)
 	if !ok || i != 0 {
 		t.Fatalf("delayMs = %v, want 0", v)
-	}
-}
-
-// TestWriteStatusTrimsLinesForNewClient: the served copy drops "lines" for a
-// new client (the one that sent delayMs) but keeps prevLine; an old client
-// (trim off) still receives the full "lines" array.
-func TestWriteStatusTrimsLinesForNewClient(t *testing.T) {
-	lines := []lyricLine{{T: 0, Text: "a"}, {T: 1000, Text: "b"}, {T: 2000, Text: "c"}}
-	srv := &relayServer{hub: newStatusHub()}
-	srv.hub.publish(map[string]any{
-		"ok": true, "line": 1, "lineText": "b", "prevLine": "a", "lines": lines,
-	})
-
-	rrNew := httptest.NewRecorder()
-	srv.writeStatus(rrNew, true)
-	bodyNew := rrNew.Body.String()
-	if strings.Contains(bodyNew, `"lines"`) {
-		t.Fatalf("new-client response must trim the full lines array, got: %s", bodyNew)
-	}
-	if !strings.Contains(bodyNew, `"prevLine":"a"`) {
-		t.Fatalf("new-client response must keep prevLine, got: %s", bodyNew)
-	}
-
-	rrOld := httptest.NewRecorder()
-	srv.writeStatus(rrOld, false)
-	bodyOld := rrOld.Body.String()
-	if !strings.Contains(bodyOld, `"lines"`) {
-		t.Fatalf("old-client response must keep the full lines array, got: %s", bodyOld)
 	}
 }
 
