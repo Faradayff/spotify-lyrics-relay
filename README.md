@@ -80,6 +80,14 @@ directly, so what a `curl` shows is exactly what the app renders.
     single block (no per-line sync possible).
   - `"none"` — no lyrics found for this track: render your own
     "no lyrics" / "letra no disponible" placeholder.
+- If the lyrics provider (lrcLib) failed transiently — it is a small free
+  service that intermittently answers `503 "ServerOverloaded"` — the payload
+  carries an `"error"` string (`lrclib 503: …`, `429`, …) while
+  `lyricsStatus` is `"none"` until it clears. The relay already retried the
+  request inline (up to 3 attempts, spaced 0.75 s / 2 s, honoring a
+  `Retry-After` when present) and keeps retrying per failed track with a
+  growing backoff window (1 min, 2 min, … capped 15 min), so a provider
+  storm usually clears itself without client action.
 - When not authenticated: `{ "ok": false, "auth": false, "error": "..." }`.
 
 ### Wait mode (long-poll)

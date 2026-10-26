@@ -3,6 +3,7 @@ package main
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -213,14 +214,16 @@ func TestLyricPayload(t *testing.T) {
 
 // newTestLyricsClient points the cached client at a fake provider so the
 // tests can count exactly how many upstream requests a sequence of lookups
-// produces.
+// produces. Waits are no-ops so retry behavior is exercised without delay.
 func newTestLyricsClient(base string, errTTL time.Duration) *lyricsClient {
 	return &lyricsClient{
-		base:     base,
-		cache:    map[string]cacheEntry{},
-		inflight: map[string]struct{}{},
-		errTTL:   errTTL,
-		http:     &http.Client{Timeout: 2 * time.Second},
+		base:      base,
+		cache:     map[string]cacheEntry{},
+		inflight:  map[string]struct{}{},
+		errTTL:    errTTL,
+		retryBase: []time.Duration{time.Millisecond, time.Millisecond},
+		sleep:     func(time.Duration) {},
+		http:      &http.Client{Timeout: 2 * time.Second},
 	}
 }
 
@@ -248,8 +251,10 @@ func TestGetForTrack_CachesProviderFailures(t *testing.T) {
 	if _, err := l.getForTrack(tr); err == nil {
 		t.Fatal("expected the cached error to be replayed")
 	}
-	if hits != 1 {
-		t.Fatalf("provider hit %d times, want 1", hits)
+	// The first lookup spends its 3 inline attempts on the provider; the
+	// replayed error must add nothing.
+	if hits != 3 {
+		t.Fatalf("provider hit %d times, want 3", hits)
 	}
 }
 
@@ -332,8 +337,145 @@ func TestGetForTrack_RetriesAfterErrorTTL(t *testing.T) {
 	if _, err := l.getForTrack(tr); err == nil {
 		t.Fatal("expected an error after the retry")
 	}
+	// Three inline attempts per lookup, two lookups.
+	if hits != 6 {
+		t.Fatalf("provider hit %d times, want 6", hits)
+	}
+}
+
+// A transient 503 ("ServerOverloaded") followed by a 200 must surface a
+// success — lrcLib's intermittent overload must not become a user-visible
+// "no lyrics" for a track it does have.
+func TestGetForTrack_RetriesTransient503ThenSucceeds(t *testing.T) {
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		if hits == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"message":"The server is busy, please retry in a moment","name":"ServerOverloaded","statusCode":503}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"syncedLyrics":"[00:01.00]one","plainLyrics":"one"}`))
+	}))
+	defer srv.Close()
+
+	l := newTestLyricsClient(srv.URL, time.Minute)
+	d, err := l.getForTrack(songTrack())
+	if err != nil || d == nil || !d.Synced {
+		t.Fatalf("expected success after a transient 503, got %v %+v", err, d)
+	}
 	if hits != 2 {
 		t.Fatalf("provider hit %d times, want 2", hits)
+	}
+}
+
+// A 429 that names a Retry-After longer than maxInlineWait must not be
+// slept inline: the lookup gives up after one request and carries the
+// window in the error cache, replaying it without hitting the provider.
+func TestGetForTrack_HonorsLongRetryAfterViaCache(t *testing.T) {
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.Header().Set("Retry-After", "120")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"message":"Rate limit exceeded"}`))
+	}))
+	defer srv.Close()
+
+	l := newTestLyricsClient(srv.URL, time.Minute)
+	if _, err := l.getForTrack(songTrack()); err == nil {
+		t.Fatal("expected an error for a 429 provider")
+	}
+	if hits != 1 {
+		t.Fatalf("provider hit %d times, want 1 (long Retry-After must not be re-tried inline)", hits)
+	}
+	l.mu.Lock()
+	e, ok := l.cache["track-1|Band"]
+	l.mu.Unlock()
+	if !ok || e.err == nil {
+		t.Fatalf("expected a cached error entry, got %+v (%v)", e, ok)
+	}
+	if e.errTTL != 120*time.Second {
+		t.Fatalf("cached error window = %v, want the provider's 120s", e.errTTL)
+	}
+	// Within the window: replay, no new provider hit.
+	if _, err := l.getForTrack(songTrack()); err == nil {
+		t.Fatal("expected the cached error to be replayed")
+	}
+	if hits != 1 {
+		t.Fatalf("provider hit %d times during the window, want 1", hits)
+	}
+}
+
+// A 429 with a small Retry-After (within maxInlineWait) is honored inline:
+// every attempt is spaced by the provider's value.
+func TestGetForTrack_RetriesInlineWithShortRetryAfter(t *testing.T) {
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.Header().Set("Retry-After", "5")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+
+	l := newTestLyricsClient(srv.URL, time.Minute)
+	if _, err := l.getForTrack(songTrack()); err == nil {
+		t.Fatal("expected an error while the provider keeps 429-ing")
+	}
+	if hits != maxFetchAttempts {
+		t.Fatalf("provider hit %d times, want %d", hits, maxFetchAttempts)
+	}
+}
+
+// Repeated failures of the same track back the error window off
+// exponentially (base, base*2, ...): the second failure's window must be
+// double the first's for the same base TTL.
+func TestGetForTrack_BacksoffErrorWindowOnRepeatedFailures(t *testing.T) {
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+
+	base := 30 * time.Millisecond
+	l := newTestLyricsClient(srv.URL, base)
+	tr := songTrack()
+
+	l.getForTrack(tr)
+	l.mu.Lock()
+	first := l.cache["track-1|Band"].errTTL
+	l.mu.Unlock()
+	if first != base {
+		t.Fatalf("first failure window = %v, want the base %v", first, base)
+	}
+
+	time.Sleep(60 * time.Millisecond) // expire the first window
+	l.getForTrack(tr)
+	l.mu.Lock()
+	second := l.cache["track-1|Band"].errTTL
+	l.mu.Unlock()
+	if second != base*2 {
+		t.Fatalf("second failure window = %v, want double the base %v", second, base*2)
+	}
+}
+
+// lrcLib requires an identifying User-Agent on every request; without one
+// we are indistinguishable from a generic crawler and get throttled.
+func TestFetchOnce_SendsIdentifyingUserAgent(t *testing.T) {
+	var ua string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ua = r.Header.Get("User-Agent")
+		_, _ = w.Write([]byte(`{"syncedLyrics":"[00:01.00]one"}`))
+	}))
+	defer srv.Close()
+
+	l := newTestLyricsClient(srv.URL, time.Minute)
+	if _, _, err := l.fetchOnce(srv.URL + "/get?track_name=x"); err != nil {
+		t.Fatalf("fetchOnce failed: %v", err)
+	}
+	if !strings.HasPrefix(ua, "spotify-lyrics-relay") {
+		t.Fatalf("User-Agent %q does not identify the client (lrcLib requires it)", ua)
 	}
 }
 

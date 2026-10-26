@@ -20,6 +20,24 @@ const (
 	// from the cache instead of being re-requested. Long enough to ride out a
 	// rate-limit window, short enough to retry soon.
 	errorCacheTTL = 60 * time.Second
+	// maxFetchAttempts: how many requests a single lookup spends on the
+	// provider before giving up and handing the failure to the
+	// error-window cache. lrcLib is a free service that throttles bursts,
+	// so a first request hitting its limiter does not mean the lyrics are
+	// absent — we retry it inline before surfacing an error.
+	maxFetchAttempts = 3
+	// maxInlineWait: how long a /status call may block honoring a
+	// Retry-After inline. Longer windows are honored through the
+	// error-window cache instead of sleeping in the request path.
+	maxInlineWait = 10 * time.Second
+	// maxErrWindow: cap for the exponential error-window backoff when a
+	// track keeps failing.
+	maxErrWindow = 15 * time.Minute
+	// userAgent: lrcLib asks every client to identify itself with name and a
+	// link to its project (https://lrclib.net/docs, "we require you to
+	// identify your client"). The Go default UA marks us as a generic
+	// bot — a likely reason for being throttled with a 503.
+	userAgent = "spotify-lyrics-relay (https://github.com/Faradayff/spotify-lyrics-relay)"
 )
 
 type lyricLine struct {
@@ -34,6 +52,24 @@ type lyricsData struct {
 	LinesCount int         `json:"linesCount,omitempty"`
 }
 
+// providerError is a non-2xx answer from the lyrics provider. 429/5xx
+// (lrcLib's "ServerOverloaded") are transient: worth retrying inline and,
+// if that still fails, riding out through the error window.
+type providerError struct {
+	status     int
+	detail     string        // truncated upstream answer body
+	retryAfter time.Duration // from the Retry-After header, 0 when absent
+}
+
+func (e *providerError) Error() string {
+	return fmt.Sprintf("lrclib %d: %s", e.status, e.detail)
+}
+
+// retryable reports whether the provider asked to be tried again later.
+func (e *providerError) retryable() bool {
+	return e.status == http.StatusTooManyRequests || e.status >= 500
+}
+
 // cacheEntry holds either a successful lookup (data) or a provider failure
 // (err) so the wait-mode refresh loop can replay it for a short window
 // instead of hammering the upstream again on every 300 ms tick.
@@ -41,6 +77,13 @@ type cacheEntry struct {
 	at   time.Time
 	data lyricsData
 	err  error
+	// errTTL is the effective replay window for err: the provider's
+	// Retry-After when it sent one, otherwise the base error window backed
+	// off exponentially while the failures pile up (0 = client default).
+	errTTL time.Duration
+	// fails counts consecutive provider failures for this key (a success
+	// resets it) and feeds the exponential error-window backoff.
+	fails int
 }
 
 type lyricsClient struct {
@@ -50,18 +93,22 @@ type lyricsClient struct {
 	// inflight marks keys a fetch is already running for, so a concurrent
 	// tick (or app + curl at once) skips its own request instead of
 	// duplicating it.
-	inflight map[string]struct{}
-	errTTL   time.Duration
-	http     *http.Client
+	inflight  map[string]struct{}
+	errTTL    time.Duration
+	retryBase []time.Duration // inline waits between attempts (tests shorten)
+	sleep     func(time.Duration)
+	http      *http.Client
 }
 
 func newLyricsClient() *lyricsClient {
 	return &lyricsClient{
-		base:     lrclibBase,
-		cache:    map[string]cacheEntry{},
-		inflight: map[string]struct{}{},
-		errTTL:   errorCacheTTL,
-		http:     &http.Client{Timeout: 20 * time.Second},
+		base:      lrclibBase,
+		cache:     map[string]cacheEntry{},
+		inflight:  map[string]struct{}{},
+		errTTL:    errorCacheTTL,
+		retryBase: []time.Duration{750 * time.Millisecond, 2 * time.Second},
+		sleep:     time.Sleep,
+		http:      &http.Client{Timeout: 20 * time.Second},
 	}
 }
 
@@ -136,7 +183,12 @@ func (l *lyricsClient) artistName(track map[string]any) string {
 	return ""
 }
 
-func (l *lyricsClient) fetch(track map[string]any) (map[string]any, error) {
+// fetch resolves a track at the provider, retrying transient failures
+// (429/5xx) inline before surfacing an error: lrcLib is a small free
+// service that answers intermittently with "ServerOverloaded", and the
+// error-window cache alone would take a whole minute to notice that the
+// storm has passed. It never blocks longer than maxInlineWait per lookup.
+func (l *lyricsClient) fetch(track map[string]any) (map[string]any, *providerError, error) {
 	name, _ := track["name"].(string)
 	albumName := ""
 	if a, ok := track["album"].(map[string]any); ok {
@@ -157,32 +209,93 @@ func (l *lyricsClient) fetch(track map[string]any) (map[string]any, error) {
 		q.Set("duration", strconv.Itoa(durMs/1000))
 	}
 	u := l.base + "/get?" + q.Encode()
+
+	var perr *providerError
+	var lastErr error
+	for attempt := 1; attempt <= maxFetchAttempts; attempt++ {
+		if attempt > 1 {
+			// Wait out the provider's window before retrying. A longer
+			// window (big Retry-After) is not slept inline: the error
+			// window carries it and the next lookup retries for real.
+			wait := l.retryWait(perr, attempt)
+			if wait > maxInlineWait {
+				break
+			}
+			l.sleep(wait)
+		}
+		m, p, err := l.fetchOnce(u)
+		if p == nil && err == nil {
+			return m, nil, nil // 2xx, or a 404 ("no lyrics for this track")
+		}
+		perr, lastErr = p, err
+		if p != nil && !p.retryable() {
+			break // 4xx (other than 429): retrying will not help
+		}
+	}
+	return nil, perr, lastErr
+}
+
+// retryWait is the inline wait before the given attempt: the provider's
+// Retry-After for a 429, otherwise the exponential base.
+func (l *lyricsClient) retryWait(perr *providerError, attempt int) time.Duration {
+	if perr != nil && perr.status == http.StatusTooManyRequests && perr.retryAfter > 0 {
+		return perr.retryAfter
+	}
+	if len(l.retryBase) == 0 {
+		return time.Second
+	}
+	i := attempt - 2 // the wait before attempt 2, 3, ...
+	if i < 0 {
+		i = 0
+	}
+	if i >= len(l.retryBase) {
+		i = len(l.retryBase) - 1
+	}
+	return l.retryBase[i]
+}
+
+// fetchOnce performs a single GET against the provider.
+func (l *lyricsClient) fetchOnce(u string) (map[string]any, *providerError, error) {
 	req, err := http.NewRequest("GET", u, nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", userAgent)
 	resp, err := l.http.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
-		return nil, nil
+		return nil, nil, nil // the track simply has no lyrics there
 	}
 	if resp.StatusCode >= 400 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-		return nil, fmt.Errorf("lrclib %d: %s", resp.StatusCode, string(b))
+		return nil, &providerError{
+			status:     resp.StatusCode,
+			detail:     string(b),
+			retryAfter: retryAfterFrom(resp),
+		}, nil
 	}
 	b, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	var m map[string]any
 	if err := json.Unmarshal(b, &m); err != nil {
-		return map[string]any{}, nil
+		return map[string]any{}, nil, nil
 	}
-	return m, nil
+	return m, nil, nil
+}
+
+// retryAfterFrom parses a plain-seconds Retry-After header (0 when absent).
+func retryAfterFrom(resp *http.Response) time.Duration {
+	n, err := strconv.Atoi(resp.Header.Get("Retry-After"))
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return time.Duration(n) * time.Second
 }
 
 // decodeLyrics maps a LRCLIB /get response (fields "syncedLyrics" /
@@ -208,6 +321,42 @@ func decodeLyrics(m map[string]any) lyricsData {
 	return out
 }
 
+// errWindow is the effective replay window for a cached provider failure.
+func (l *lyricsClient) errWindow(e cacheEntry) time.Duration {
+	if e.errTTL > 0 {
+		return e.errTTL
+	}
+	return l.errTTL
+}
+
+// errWindowFor decides how long a fresh provider failure stays cached: the
+// provider's Retry-After when it sent one (clamped), otherwise the base
+// window doubled for each consecutive failure of the same track.
+func (l *lyricsClient) errWindowFor(perr *providerError, prevFails int) time.Duration {
+	if perr != nil && perr.status == http.StatusTooManyRequests && perr.retryAfter > 0 {
+		w := perr.retryAfter
+		if w < l.errTTL {
+			w = l.errTTL
+		}
+		if w > maxErrWindow {
+			w = maxErrWindow
+		}
+		return w
+	}
+	shift := prevFails
+	if shift > 5 {
+		shift = 5
+	}
+	w := l.errTTL << shift
+	if w <= 0 {
+		w = l.errTTL
+	}
+	if w > maxErrWindow {
+		w = maxErrWindow
+	}
+	return w
+}
+
 func (l *lyricsClient) getForTrack(track map[string]any) (*lyricsData, error) {
 	if track == nil {
 		return nil, fmt.Errorf("nil track")
@@ -216,7 +365,7 @@ func (l *lyricsClient) getForTrack(track map[string]any) (*lyricsData, error) {
 	l.mu.Lock()
 	if e, ok := l.cache[key]; ok {
 		age := time.Since(e.at)
-		if e.err != nil && age < l.errTTL {
+		if e.err != nil && age < l.errWindow(e) {
 			// Replay the recent provider failure without re-requesting it:
 			// the wait-mode loop recomputes every 300 ms, and without this
 			// each tick re-rains LRCLIB during a 429 window.
@@ -244,10 +393,27 @@ func (l *lyricsClient) getForTrack(track map[string]any) (*lyricsData, error) {
 		l.mu.Unlock()
 	}()
 
-	m, err := l.fetch(track)
+	m, perr, ferr := l.fetch(track)
+	var toSave error
+	if perr != nil {
+		toSave = perr
+	} else {
+		toSave = ferr
+	}
 	out := decodeLyrics(m)
 	l.mu.Lock()
-	l.cache[key] = cacheEntry{at: time.Now(), data: out, err: err}
+	// While the failures pile up for this key, back the error window off
+	// (a success resets the fail count).
+	prevFails := 0
+	if prev, ok := l.cache[key]; ok && prev.err != nil {
+		prevFails = prev.fails
+	}
+	e := cacheEntry{at: time.Now(), data: out, err: toSave}
+	if toSave != nil {
+		e.errTTL = l.errWindowFor(perr, prevFails)
+		e.fails = prevFails + 1
+	}
+	l.cache[key] = e
 	l.mu.Unlock()
-	return &out, err
+	return &out, toSave
 }
