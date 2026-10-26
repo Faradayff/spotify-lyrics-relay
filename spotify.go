@@ -15,10 +15,10 @@ import (
 )
 
 const (
-	APIBase    = "https://api.spotify.com"
-	AuthURL    = "https://accounts.spotify.com/authorize"
-	TokenURL   = "https://accounts.spotify.com/api/token"
-	Scope      = "user-read-playback-state user-read-currently-playing streaming"
+	APIBase  = "https://api.spotify.com"
+	AuthURL  = "https://accounts.spotify.com/authorize"
+	TokenURL = "https://accounts.spotify.com/api/token"
+	Scope    = "user-read-playback-state user-read-currently-playing streaming"
 )
 
 type spotifyTokens struct {
