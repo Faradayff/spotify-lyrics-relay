@@ -1,9 +1,11 @@
 package main
 
 import (
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -220,6 +222,9 @@ func newTestLyricsClient(base string, errTTL time.Duration) *lyricsClient {
 		base:      base,
 		cache:     map[string]cacheEntry{},
 		inflight:  map[string]struct{}{},
+		now:       time.Now,
+		minGap:    time.Millisecond, // keep multi-lookup tests snappy; gap has its own test
+		logf:      func(string, ...any) {},
 		errTTL:    errTTL,
 		retryBase: []time.Duration{time.Millisecond, time.Millisecond},
 		sleep:     func(time.Duration) {},
@@ -231,9 +236,11 @@ func songTrack() map[string]any {
 	return map[string]any{"id": "track-1", "name": "Song", "artist": "Band"}
 }
 
-// A provider failure (LRCLIB 429) must be replayed from the cache for the
-// error window — a second lookup of the same track may not re-hit the
-// upstream while the first caller is still waiting on it.
+// A provider failure (LRCLIB 429 "ServerOverloaded") must cost exactly ONE
+// request and come back as the pending state — the retry is owned by the
+// backoff windows (per track + global), not by inline re-tries, and a
+// second lookup of the same track replays the pending state without any
+// further upstream traffic.
 func TestGetForTrack_CachesProviderFailures(t *testing.T) {
 	hits := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -245,16 +252,18 @@ func TestGetForTrack_CachesProviderFailures(t *testing.T) {
 
 	l := newTestLyricsClient(srv.URL, time.Minute)
 	tr := songTrack()
-	if _, err := l.getForTrack(tr); err == nil {
-		t.Fatal("expected an error for a 429 provider")
+	_, err := l.getForTrack(tr)
+	if p, ok := asLyricsPending(err); !ok || p.cause == nil {
+		t.Fatalf("expected a pending state with a provider cause, got %v", err)
 	}
-	if _, err := l.getForTrack(tr); err == nil {
-		t.Fatal("expected the cached error to be replayed")
+	_, err = l.getForTrack(tr)
+	if _, ok := asLyricsPending(err); !ok {
+		t.Fatalf("expected the cached pending state to be replayed, got %v", err)
 	}
-	// The first lookup spends its 3 inline attempts on the provider; the
-	// replayed error must add nothing.
-	if hits != 3 {
-		t.Fatalf("provider hit %d times, want 3", hits)
+	// One request per lookup; the 429 is final for the lookup and the
+	// replayed pending state must add nothing.
+	if hits != 1 {
+		t.Fatalf("provider hit %d times, want 1", hits)
 	}
 }
 
@@ -287,9 +296,9 @@ func TestGetForTrack_CachesSuccess(t *testing.T) {
 // skips this tick and the provider sees exactly one hit.
 func TestGetForTrack_SkipsInflightConcurrentFetch(t *testing.T) {
 	release := make(chan struct{})
-	hits := 0
+	var hits int64 // atomic: the handler and the test goroutine touch it concurrently
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hits++
+		atomic.AddInt64(&hits, 1)
 		<-release // hold the request open until the test lets it through
 	}))
 	defer srv.Close()
@@ -304,22 +313,27 @@ func TestGetForTrack_SkipsInflightConcurrentFetch(t *testing.T) {
 
 	// Wait until the first request is actually in flight.
 	deadline := time.Now().Add(2 * time.Second)
-	for hits == 0 && time.Now().Before(deadline) {
+	for atomic.LoadInt64(&hits) == 0 && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	// While the first fetch is in flight, a second lookup of the same key
-	// must skip the provider for this tick.
-	if d, err := l.getForTrack(tr); err != nil || d != nil {
-		t.Fatalf("in-flight duplicate should give (nil, nil), got %v %v", d, err)
+	// must report pending for this tick instead of duplicating the request.
+	d, err := l.getForTrack(tr)
+	if d != nil {
+		t.Fatalf("in-flight duplicate should not resolve data, got %+v", d)
+	}
+	if p, ok := asLyricsPending(err); !ok || p.cause != nil {
+		t.Fatalf("in-flight duplicate should be a deferral (no cause), got %v", err)
 	}
 	close(release)
 	<-done
-	if hits != 1 {
-		t.Fatalf("provider hit %d times, want 1", hits)
+	if n := atomic.LoadInt64(&hits); n != 1 {
+		t.Fatalf("provider hit %d times, want 1", n)
 	}
 }
 
-// Once the error window expires the lookup retries the provider.
+// Once the error window expires the lookup retries the provider: one
+// request per attempt window.
 func TestGetForTrack_RetriesAfterErrorTTL(t *testing.T) {
 	hits := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -331,22 +345,23 @@ func TestGetForTrack_RetriesAfterErrorTTL(t *testing.T) {
 	l := newTestLyricsClient(srv.URL, 30*time.Millisecond)
 	tr := songTrack()
 	if _, err := l.getForTrack(tr); err == nil {
-		t.Fatal("expected an error")
+		t.Fatal("expected a pending state")
 	}
 	time.Sleep(60 * time.Millisecond) // let the error window expire
 	if _, err := l.getForTrack(tr); err == nil {
-		t.Fatal("expected an error after the retry")
+		t.Fatal("expected a pending state after the retry")
 	}
-	// Three inline attempts per lookup, two lookups.
-	if hits != 6 {
-		t.Fatalf("provider hit %d times, want 6", hits)
+	// One inline-final request per lookup, two lookups.
+	if hits != 2 {
+		t.Fatalf("provider hit %d times, want 2", hits)
 	}
 }
 
 // A transient 503 ("ServerOverloaded") followed by a 200 must surface a
-// success — lrcLib's intermittent overload must not become a user-visible
-// "no lyrics" for a track it does have.
-func TestGetForTrack_RetriesTransient503ThenSucceeds(t *testing.T) {
+// success AFTER its window expires — lrcLib's intermittent overload must not
+// become a user-visible failure for a track it does have. It shows as the
+// pending state in between, never as an error.
+func TestGetForTrack_RetriesAfterWindowThenSucceeds(t *testing.T) {
 	hits := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits++
@@ -359,19 +374,58 @@ func TestGetForTrack_RetriesTransient503ThenSucceeds(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	l := newTestLyricsClient(srv.URL, time.Minute)
+	l := newTestLyricsClient(srv.URL, 30*time.Millisecond)
 	d, err := l.getForTrack(songTrack())
+	if d != nil {
+		t.Fatalf("first lookup must be pending, got %+v", d)
+	}
+	if _, ok := asLyricsPending(err); !ok {
+		t.Fatalf("expected a pending state after the transient 503, got %v", err)
+	}
+	time.Sleep(60 * time.Millisecond) // let the backoff window expire
+	d, err = l.getForTrack(songTrack())
 	if err != nil || d == nil || !d.Synced {
-		t.Fatalf("expected success after a transient 503, got %v %+v", err, d)
+		t.Fatalf("expected success after the window expired, got %v %+v", err, d)
 	}
 	if hits != 2 {
-		t.Fatalf("provider hit %d times, want 2", hits)
+		t.Fatalf("provider hit %d times, want 2 (one per window)", hits)
 	}
 }
 
-// A 429 that names a Retry-After longer than maxInlineWait must not be
-// slept inline: the lookup gives up after one request and carries the
-// window in the error cache, replaying it without hitting the provider.
+// Transport errors (socket closed before the request reached the provider)
+// are retried inline: the provider never saw them, so re-attempting is free.
+func TestFetch_TransportErrorsRetriedInline(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("no local networking available: %v", err)
+	}
+	defer ln.Close()
+	var conns int64
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			atomic.AddInt64(&conns, 1)
+			c.Close() // connection aborted: client sees a transport error
+		}
+	}()
+
+	l := newTestLyricsClient("http://"+ln.Addr().String(), time.Minute)
+	_, perr, ferr := l.fetch(songTrack())
+	if perr != nil || ferr == nil {
+		t.Fatalf("expected a transport error, got perr=%v err=%v", perr, ferr)
+	}
+	if n := atomic.LoadInt64(&conns); n != maxFetchAttempts {
+		t.Fatalf("provider saw %d connections, want %d inline (re)attempts", n, maxFetchAttempts)
+	}
+}
+
+// A 429 that names a Retry-After must never be re-tried inline: the lookup
+// settles after exactly one request and the window is carried by the error
+// cache (per track) AND the global backoff, replaying it without hitting
+// the provider.
 func TestGetForTrack_HonorsLongRetryAfterViaCache(t *testing.T) {
 	hits := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -383,47 +437,33 @@ func TestGetForTrack_HonorsLongRetryAfterViaCache(t *testing.T) {
 	defer srv.Close()
 
 	l := newTestLyricsClient(srv.URL, time.Minute)
-	if _, err := l.getForTrack(songTrack()); err == nil {
-		t.Fatal("expected an error for a 429 provider")
+	_, err := l.getForTrack(songTrack())
+	if p, ok := asLyricsPending(err); !ok || p.cause == nil {
+		t.Fatalf("expected a pending state for a 429 provider, got %v", err)
 	}
 	if hits != 1 {
 		t.Fatalf("provider hit %d times, want 1 (long Retry-After must not be re-tried inline)", hits)
 	}
 	l.mu.Lock()
 	e, ok := l.cache["track-1|Band"]
+	global := l.globalWindowUntil
 	l.mu.Unlock()
 	if !ok || e.err == nil {
-		t.Fatalf("expected a cached error entry, got %+v (%v)", e, ok)
+		t.Fatalf("expected a cached failure entry, got %+v (%v)", e, ok)
 	}
 	if e.errTTL != 120*time.Second {
-		t.Fatalf("cached error window = %v, want the provider's 120s", e.errTTL)
+		t.Fatalf("cached per-track window = %v, want the provider's 120s", e.errTTL)
+	}
+	// The refusal must also extend the CLIENT-WIDE backoff window.
+	if rem := global.Sub(l.now()); rem < 110*time.Second || rem > 125*time.Second {
+		t.Fatalf("global backoff = %v, want ~the provider's 120s", rem)
 	}
 	// Within the window: replay, no new provider hit.
 	if _, err := l.getForTrack(songTrack()); err == nil {
-		t.Fatal("expected the cached error to be replayed")
+		t.Fatal("expected the pending state to be replayed")
 	}
 	if hits != 1 {
 		t.Fatalf("provider hit %d times during the window, want 1", hits)
-	}
-}
-
-// A 429 with a small Retry-After (within maxInlineWait) is honored inline:
-// every attempt is spaced by the provider's value.
-func TestGetForTrack_RetriesInlineWithShortRetryAfter(t *testing.T) {
-	hits := 0
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hits++
-		w.Header().Set("Retry-After", "5")
-		w.WriteHeader(http.StatusTooManyRequests)
-	}))
-	defer srv.Close()
-
-	l := newTestLyricsClient(srv.URL, time.Minute)
-	if _, err := l.getForTrack(songTrack()); err == nil {
-		t.Fatal("expected an error while the provider keeps 429-ing")
-	}
-	if hits != maxFetchAttempts {
-		t.Fatalf("provider hit %d times, want %d", hits, maxFetchAttempts)
 	}
 }
 
@@ -457,6 +497,77 @@ func TestGetForTrack_BacksoffErrorWindowOnRepeatedFailures(t *testing.T) {
 	l.mu.Unlock()
 	if second != base*2 {
 		t.Fatalf("second failure window = %v, want double the base %v", second, base*2)
+	}
+}
+
+// An overload refusal on ONE track is client-wide: while the global
+// backoff window is open, a DIFFERENT track must not fire its own request —
+// it comes back pending and the refresh loop retries it when the window
+// opens.
+func TestGetForTrack_GlobalWindowDefersOtherSongs(t *testing.T) {
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+
+	l := newTestLyricsClient(srv.URL, time.Minute)
+	// Song A consumes its request and gets 429'd.
+	if _, err := l.getForTrack(songTrack()); err == nil {
+		t.Fatal("expected a pending state for the 429 track")
+	}
+	// Song B arrives while the global window is open: it must be pending,
+	// NOT re-requested.
+	other := map[string]any{"id": "track-2", "name": "Other", "artist": "Other Band"}
+	d, err := l.getForTrack(other)
+	if d != nil {
+		t.Fatalf("other song must not resolve during the global backoff: %+v", d)
+	}
+	if p, ok := asLyricsPending(err); !ok || p.retryIn <= 0 {
+		t.Fatalf("other song must be pending with a retry window, got %v", err)
+	}
+	if hits != 1 {
+		t.Fatalf("provider hit %d times, want 1 (global backoff blocks track B)", hits)
+	}
+}
+
+// minUpstreamGap spaces real requests even for fresh tracks: a burst of new
+// songs (shuffle) may not stack requests back to back — the second one is
+// deferred to a later tick.
+func TestGetForTrack_MinGapDefersBursts(t *testing.T) {
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.WriteHeader(http.StatusServiceUnavailable) // any refusal; per-track window is tiny
+	}))
+	defer srv.Close()
+
+	gap := 150 * time.Millisecond
+	l := newTestLyricsClient(srv.URL, time.Millisecond)
+	l.minGap = gap
+	// Song A consumes the request slot.
+	l.getForTrack(songTrack())
+	// Immediately a different song: deferred by the gap (its per-track
+	// window does not even exist yet — never fetched).
+	other := map[string]any{"id": "track-2", "name": "Other", "artist": "Other Band"}
+	d, err := l.getForTrack(other)
+	if d != nil {
+		t.Fatalf("burst song must not resolve during the gap: %+v", d)
+	}
+	if p, ok := asLyricsPending(err); !ok || p.retryIn <= 0 {
+		t.Fatalf("expected pending with a retry window during the gap, got %v", err)
+	}
+	if hits != 1 {
+		t.Fatalf("provider hit %d times, want 1", hits)
+	}
+	// After the gap opens, the deferred song finally consumes a slot.
+	time.Sleep(200 * time.Millisecond)
+	if _, err := l.getForTrack(other); err == nil {
+		t.Fatal("expected a pending state (503) once the gap allowed a real request")
+	}
+	if hits != 2 {
+		t.Fatalf("provider hit %d times, want 2 (one per gap)", hits)
 	}
 }
 

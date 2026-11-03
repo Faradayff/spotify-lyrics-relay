@@ -143,6 +143,13 @@ func fingerprint(p map[string]any) string {
 	b.WriteString("|")
 	b.WriteString(strconv.FormatBool(boolOr(get("lyricsSynced"))))
 	b.WriteString("|")
+	// lyricsStatus covers the none/loading transition: both render a
+	// different UI but carry no line/plain data, so without this field the
+	// bump would be missed and waiters would sleep through it. pendingMs is
+	// deliberately NOT part of the fingerprint (it ticks down every refresh
+	// and would defeat wait mode).
+	b.WriteString(strOr(get("lyricsStatus")))
+	b.WriteString("|")
 	b.WriteString(strconv.Itoa(len(strOr(get("plain")))))
 	b.WriteString("|")
 	b.WriteString(strconv.FormatBool(strOr(get("error")) != ""))

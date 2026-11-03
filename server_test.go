@@ -1,7 +1,10 @@
 package main
 
 import (
+	"errors"
+	"net/http"
 	"testing"
+	"time"
 )
 
 // TestParseDelayMs tables the validation rules for the client delayMs
@@ -77,6 +80,80 @@ func TestFindLineDelayShiftPicksEarlierLine(t *testing.T) {
 	// A large delay that lands before the first line stays on the first line.
 	if i := findLine(lines, 5000-30000); i != 0 {
 		t.Fatalf("delay before first line: expected 0 got %d", i)
+	}
+}
+
+// TestLyricsStateFields_PendingIsLoadingNotError: while the lyrics are in
+// flight or riding out a backoff window the payload must say "loading"
+// (with a pendingMs hint) and must NOT carry an error field — the app
+// renders a loading state, and the relay's own backoff owns the retry.
+func TestLyricsStateFields_PendingIsLoadingNotError(t *testing.T) {
+	cause := &providerError{status: http.StatusTooManyRequests, detail: "ServerOverloaded"}
+	pend := lyricsPendingError(cause, 5*time.Second)
+	out := lyricsStateFields(nil, -1, pend)
+	if out["lyricsStatus"] != "loading" {
+		t.Fatalf("pending must surface as lyricsStatus=loading, got %v", out["lyricsStatus"])
+	}
+	if _, ok := out["error"]; ok {
+		t.Fatalf("pending must not surface an error field: %+v", out)
+	}
+	if v, ok := out["pendingMs"].(int64); !ok || v != 5000 {
+		t.Fatalf("pendingMs = %v, want 5000", out["pendingMs"])
+	}
+	if _, ok := out["line"]; ok {
+		t.Fatalf("no line fields while loading: %+v", out)
+	}
+	if out["lyricsSynced"] != false {
+		t.Fatalf("lyricsSynced must be false while loading: %+v", out)
+	}
+	if v, ok := out["lyricsLines"].(int); !ok || v != 0 {
+		t.Fatalf("lyricsLines must be 0 while loading: %+v", out)
+	}
+}
+
+// TestLyricsStateFields_SyncedRegression: a successful resolution renders
+// exactly the pre-change fields (line/lineText/prevLine/nextLines).
+func TestLyricsStateFields_SyncedRegression(t *testing.T) {
+	data := &lyricsData{Synced: true, Lines: []lyricLine{{T: 0, Text: "a"}, {T: 1000, Text: "b"}}, LinesCount: 2}
+	out := lyricsStateFields(data, 0, nil)
+	if out["lyricsStatus"] != "synced" {
+		t.Fatalf("want synced, got %v", out["lyricsStatus"])
+	}
+	if out["line"] != 0 || out["lineText"] != "a" {
+		t.Fatalf("active line wrong: %+v", out)
+	}
+	if _, ok := out["error"]; ok {
+		t.Fatalf("no error field on success: %+v", out)
+	}
+	if _, ok := out["pendingMs"]; ok {
+		t.Fatalf("no pendingMs on success: %+v", out)
+	}
+}
+
+// TestLyricsStateFields_NoLyricsAtAll: a 404 ("no lyrics") stays a clean
+// "none" — no error, no pending, no loading.
+func TestLyricsStateFields_NoLyricsAtAll(t *testing.T) {
+	out := lyricsStateFields(nil, -1, nil)
+	if out["lyricsStatus"] != "none" {
+		t.Fatalf("want none, got %v", out["lyricsStatus"])
+	}
+	if _, ok := out["error"]; ok {
+		t.Fatalf("no-lyrics must not surface an error: %+v", out)
+	}
+	if _, ok := out["pendingMs"]; ok {
+		t.Fatalf("no-lyrics must not carry pendingMs: %+v", out)
+	}
+}
+
+// TestLyricsStateFields_NonPendingErrorStillSurfaces: errors that are NOT a
+// provider pending state (Spotify-side or unexpected) keep the error field.
+func TestLyricsStateFields_NonPendingErrorStillSurfaces(t *testing.T) {
+	out := lyricsStateFields(nil, -1, errors.New("spotify 500: boom"))
+	if out["error"] != "spotify 500: boom" {
+		t.Fatalf("non-pending errors must keep the error field: %+v", out)
+	}
+	if out["lyricsStatus"] != "none" {
+		t.Fatalf("want none, got %v", out["lyricsStatus"])
 	}
 }
 

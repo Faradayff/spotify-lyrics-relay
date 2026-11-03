@@ -83,6 +83,11 @@ func TestFingerprintDetectsEveryVisibleChange(t *testing.T) {
 		"plainPresence": {"plain": "abc"},
 		"errorPresence": {"error": "boom"},
 		"notAuthed":     {"ok": false, "auth": false},
+		// A lyrics-state transition (e.g. "loading" -> "synced") must be a
+		// visible change even when it flips line/plain fields between present
+		// and absent; this is what makes the car app wake from wait mode.
+		"lyricsStatusLoading": {"lyricsStatus": "loading"},
+		"lyricsStatusPlain":   {"lyricsStatus": "plain"},
 	}
 	base := fingerprint(basePayload(nil))
 	for name, over := range cases {
@@ -95,6 +100,77 @@ func TestFingerprintDetectsEveryVisibleChange(t *testing.T) {
 	b := fingerprint(basePayload(map[string]any{"plain": "abcdef"}))
 	if a == b {
 		t.Error("plain text length change must change the fingerprint")
+	}
+}
+
+// loadingPayload mirrors the shape /status returns while a first fetch is in
+// flight or riding out a backoff window: no line/lineText/plain, the
+// "loading" state, and a pendingMs hint (excluded from the fingerprint).
+func loadingPayload(over map[string]any) map[string]any {
+	p := map[string]any{
+		"ok":           true,
+		"auth":         true,
+		"playing":      true,
+		"positionMs":   1000,
+		"updated":      "2026-01-01T00:00:00Z",
+		"track":        &trackInfo{ID: "track-1", Name: "N", Artist: "A"},
+		"delayMs":      0,
+		"lyricsSynced": false,
+		"lyricsLines":  0,
+		"lyricsStatus": "loading",
+		"pendingMs":    4500,
+	}
+	for k, v := range over {
+		p[k] = v
+	}
+	return p
+}
+
+// A lyrics transition from the pending "loading" state to a resolved synced
+// line (and the reverse) must change the fingerprint, so wait-mode clients
+// wake up instead of sleeping through the lyric appearing. pendingMs churn
+// must NOT affect it (it ticks down every refresh).
+func TestFingerprintLoadingTransitions(t *testing.T) {
+	loading := fingerprint(loadingPayload(nil))
+	synced := fingerprint(basePayload(map[string]any{"lyricsStatus": "synced"}))
+	if loading == synced {
+		t.Fatalf("loading vs synced must fingerprint differently:\n%q\n%q", loading, synced)
+	}
+	// pendingMs ticks every refresh and must not disturb the fingerprint.
+	same := fingerprint(loadingPayload(map[string]any{"pendingMs": 1200}))
+	if loading != same {
+		t.Fatalf("pendingMs must not affect the fingerprint:\n%q\n%q", loading, same)
+	}
+	// "no lyrics" (none) vs "loading" also differ (distinct UIs).
+	none := fingerprint(map[string]any{
+		"ok": true, "auth": true, "playing": true,
+		"track":        &trackInfo{ID: "track-1"},
+		"lyricsSynced": false, "lyricsLines": 0,
+		"lyricsStatus": "none",
+	})
+	if loading == none {
+		t.Fatalf("loading vs none must fingerprint differently:\n%q\n%q", loading, none)
+	}
+}
+
+// The hub must bump its version and wake waiters when a payload flips from
+// the pending loading state to a resolved synced line — the real event the
+// car is waiting on while a lyric is being fetched/retried.
+func TestHubBumpOnLoadingToSynced(t *testing.T) {
+	h := newStatusHub()
+	h.publish(loadingPayload(nil))
+	ch, vBefore := h.changedAndVersion()
+
+	h.publish(basePayload(map[string]any{"lyricsStatus": "synced"}))
+
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatal("waiter was not woken by the loading->synced transition")
+	}
+	_, vAfter := h.response()
+	if vAfter <= vBefore {
+		t.Fatalf("version must bump on loading->synced: %d -> %d", vBefore, vAfter)
 	}
 }
 

@@ -155,29 +155,17 @@ func (s *relayServer) computeStatusPayload() map[string]any {
 	// is the one the listener hears now (the head unit plays ~delay late).
 	lyrData, lineIdx, lyrErr := s.lyricsFor(ti, position-int(delay))
 
-	lyrSynced := lyrData != nil && lyrData.Synced
-	lyrCount := 0
-	if lyrData != nil {
-		lyrCount = lyrData.LinesCount
-	}
-
 	payload := map[string]any{
-		"ok":           true,
-		"auth":         true,
-		"playing":      isPlaying,
-		"positionMs":   position,
-		"updated":      now.UTC().Format(time.RFC3339),
-		"track":        ti,
-		"delayMs":      delay,
-		"lyricsSynced": lyrSynced,
-		"lyricsLines":  lyrCount,
-		"lyricsStatus": lyricsStatus(lyrData, lineIdx),
+		"ok":         true,
+		"auth":       true,
+		"playing":    isPlaying,
+		"positionMs": position,
+		"updated":    now.UTC().Format(time.RFC3339),
+		"track":      ti,
+		"delayMs":    delay,
 	}
-	for k, v := range lyricPayload(lyrData, lineIdx) {
+	for k, v := range lyricsStateFields(lyrData, lineIdx, lyrErr) {
 		payload[k] = v
-	}
-	if lyrErr != nil {
-		payload["error"] = lyrErr.Error()
 	}
 	return payload
 }
@@ -195,6 +183,9 @@ func (s *relayServer) lyricsFor(ti *trackInfo, estMs int) (*lyricsData, int, err
 	if ti.Album != "" {
 		track["album"] = map[string]any{"name": ti.Album}
 	}
+	// A pending state (fetch in flight or inside a backoff window) comes
+	// back as a *lyricsPending error; the payload builder turns it into the
+	// "loading" state instead of surfacing it as an error.
 	data, err := s.lyrics.getForTrack(track)
 	if err != nil {
 		return nil, -1, err
@@ -203,6 +194,43 @@ func (s *relayServer) lyricsFor(ti *trackInfo, estMs int) (*lyricsData, int, err
 		return data, -1, nil
 	}
 	return data, findLine(data.Lines, estMs), nil
+}
+
+// lyricsStateFields builds the /status fields describing the lyrics
+// resolution for this payload:
+//   - success: the synced/plain content, exactly as lyricPayload provides
+//     it (line/lineText/prevLine/nextLines or plain);
+//   - a pending state (a first fetch in flight, or a provider refusal
+//     riding out its backoff window): lyricsStatus "loading" + pendingMs
+//     (≈ ms until the next attempt), and NO error field — the app renders
+//     "loading" and the relay retries on its own schedule. pendingMs is a
+//     curl/diagnostic hint; the app only needs lyricsStatus;
+//   - 404 ("no lyrics at all"): "none", no error (as before);
+//   - any other error: the "error" field (Spotify-side or unexpected —
+//     those are real and must stay visible).
+func lyricsStateFields(data *lyricsData, idx int, lyrErr error) map[string]any {
+	out := map[string]any{
+		"lyricsSynced": data != nil && data.Synced,
+		"lyricsLines":  0,
+		"lyricsStatus": lyricsStatus(data, idx),
+	}
+	if data != nil {
+		out["lyricsLines"] = data.LinesCount
+	}
+	for k, v := range lyricPayload(data, idx) {
+		out[k] = v
+	}
+	if pending, ok := asLyricsPending(lyrErr); ok {
+		out["lyricsStatus"] = "loading"
+		ms := int64(pending.retryIn / time.Millisecond)
+		if ms < 0 {
+			ms = 0
+		}
+		out["pendingMs"] = ms
+	} else if lyrErr != nil {
+		out["error"] = lyrErr.Error()
+	}
+	return out
 }
 
 // lyricPayload builds the lyric fields appended to /status: the active line

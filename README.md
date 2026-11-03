@@ -78,17 +78,30 @@ directly, so what a `curl` shows is exactly what the app renders.
     `prevLine` (the line above), `nextLines` (next 3, below).
   - `"plain"` — only unsynced text exists: one `plain` string, shown as a
     single block (no per-line sync possible).
-  - `"none"` — no lyrics found for this track: render your own
-    "no lyrics" / "letra no disponible" placeholder.
-- If the lyrics provider (lrcLib) failed transiently — it is a small free
-  service that intermittently answers `503 "ServerOverloaded"` — the payload
-  carries an `"error"` string (`lrclib 503: …`, `429`, …) while
-  `lyricsStatus` is `"none"` until it clears. The relay already retried the
-  request inline (up to 3 attempts, spaced 0.75 s / 2 s, honoring a
-  `Retry-After` when present) and keeps retrying per failed track with a
-  growing backoff window (1 min, 2 min, … capped 15 min), so a provider
-  storm usually clears itself without client action.
-- When not authenticated: `{ "ok": false, "auth": false, "error": "..." }`.
+  - `"none"` — no lyrics found for this track (a 404 from the provider):
+    render your own "no lyrics" / "letra no disponible" placeholder.
+  - `"loading"` — lyrics exist for this track but are not resolved yet: the
+    first fetch is in flight or the provider refused (overloaded / 5xx) and
+    the relay is riding out a backoff window. Render a quiet
+    "cargando letra…" state — **not** an error. See the provider-failure
+    note below; the relay retries on its own and the state flips to
+    `"synced"` / `"plain"` when the lyrics arrive (and `version` bumps, so
+    wait-mode clients wake up automatically). A `pendingMs` field (≈ ms until
+    the relay's next attempt) is included as a hint for operators/curl; the
+    app only needs `lyricsStatus`.
+- Provider failures are **not client-visible errors**. lrcLib is a small free
+  service that intermittently answers `429`/`503 "ServerOverloaded"`. The
+  relay treats each track as a single request at a time — no inline re-spam —
+  and then rides out the refusal with two backoff windows: a *per-track*
+  window (retry-when-expired, honoring the provider's `Retry-After`) and a
+  *global* window (a refusal is about *us* as a client, so while it is open no
+  other track may fire its own request). Windows grow (1 min, 2 min, …
+  capped 15 min) so an overload storm clears itself without hammering the
+  provider. The client just sees `"loading"` in the meantime, then the lyrics
+  appear — the provider's identity never reaches the UI.
+- When not authenticated: `{ "ok": false, "auth": false, "error": "..." }` —
+  the `error` field in a `ok && auth` payload is reserved for non-lyrics
+  problems (a lyrics failure arrives as `lyricsStatus: "loading"` instead).
 
 ### Wait mode (long-poll)
 
@@ -168,6 +181,9 @@ if (s.ok && s.auth) {
       break;
     case "none":
       renderPlaceholder("Letra no disponible");
+      break;
+    case "loading":
+      renderPlaceholder("Cargando letra…"); // quiet, NOT an error
       break;
   }
 }

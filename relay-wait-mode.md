@@ -75,7 +75,8 @@ changes between two state computations:
 | `lineText` | guards against a same-index different text |
 | `lyricsSynced` | band mode vs plain-lyrics mode |
 | `plain` (presence/length) | same as above, no-synced case |
-| `error` (empty vs non-empty) | error detail line in the UI |
+| `lyricsStatus` | the rendered UI — covers the `none` ↔ `loading` ↔ `synced` / `plain` transitions that flip the screen (a lyric appearing after a backoff window must wake waiters) |
+| `error` (empty vs non-empty) | reserved error line (non-lyrics problems) |
 
 These must **NOT** increment it (they change on every Spotify refresh and
 would defeat the purpose):
@@ -84,7 +85,9 @@ would defeat the purpose):
 - `lyricsLines` by itself (only meaningful together with `lyricsSynced`),
 - `nextLines` (derived from `line`),
 - `track.durMs`, `track.cover` (practically immutable per track; `track.id`
-  already covers a real change).
+  already covers a real change),
+- `pendingMs` (the relay's "next retry in" hint ticks down every refresh —
+  including it would bump `version` on every wait-mode refresh).
 
 Practical implementation: compute a canonical string (or comparable struct)
 from the allowed fields, compare with the previous one; if different →
