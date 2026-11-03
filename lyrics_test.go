@@ -1,9 +1,13 @@
 package main
 
 import (
+	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -219,16 +223,18 @@ func TestLyricPayload(t *testing.T) {
 // produces. Waits are no-ops so retry behavior is exercised without delay.
 func newTestLyricsClient(base string, errTTL time.Duration) *lyricsClient {
 	return &lyricsClient{
-		base:      base,
-		cache:     map[string]cacheEntry{},
-		inflight:  map[string]struct{}{},
-		now:       time.Now,
-		minGap:    time.Millisecond, // keep multi-lookup tests snappy; gap has its own test
-		logf:      func(string, ...any) {},
-		errTTL:    errTTL,
-		retryBase: []time.Duration{time.Millisecond, time.Millisecond},
-		sleep:     func(time.Duration) {},
-		http:      &http.Client{Timeout: 2 * time.Second},
+		base:        base,
+		cache:       map[string]cacheEntry{},
+		inflight:    map[string]struct{}{},
+		now:         time.Now,
+		minGap:      time.Millisecond, // keep multi-lookup tests snappy; gap has its own test
+		logf:        func(string, ...any) {},
+		errTTL:      errTTL,
+		retryBase:   []time.Duration{time.Millisecond, time.Millisecond},
+		sleep:       func(time.Duration) {},
+		http:        &http.Client{Timeout: 2 * time.Second},
+		ttl:         time.Hour, // explicit cache policy: zero would mean "never expires"
+		noLyricsTTL: time.Hour,
 	}
 }
 
@@ -609,5 +615,302 @@ func TestLyricsStatus(t *testing.T) {
 	}
 	if got := lyricsStatus(&lyricsData{}, -1); got != "none" {
 		t.Fatalf("want none for empty data, got %q", got)
+	}
+}
+
+// --- Persistent cache: on-disk layer, TTL, limits, wipe ---
+
+// TestDiskCache_RoundTripSurvivesRestart: a resolved lyric is persisted and
+// a brand-new client (a "container restart") serves the same track from
+// disk with zero provider traffic.
+func TestDiskCache_RoundTripSurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"syncedLyrics":"[00:01.00]one","plainLyrics":"one"}`))
+	}))
+	l1 := newTestLyricsClient(srv.URL, time.Minute)
+	l1.stateDir = dir
+	if d, err := l1.getForTrack(songTrack()); err != nil || d == nil || !d.Synced {
+		t.Fatalf("first fetch failed: %v %+v", err, d)
+	}
+	srv.Close()
+
+	diskDir := filepath.Join(dir, "lyrics")
+	ents, err := os.ReadDir(diskDir)
+	if err != nil || len(ents) != 1 {
+		t.Fatalf("expected exactly one cached file, got %v (%v)", ents, err)
+	}
+
+	// Restart: a fresh client whose provider now refuses.
+	denied := 0
+	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		denied++
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv2.Close()
+	l2 := newTestLyricsClient(srv2.URL, time.Minute)
+	l2.stateDir = dir
+	d, err := l2.getForTrack(songTrack())
+	if err != nil || d == nil || !d.Synced || len(d.Lines) != 1 {
+		t.Fatalf("fresh client must serve from disk: %v %+v", err, d)
+	}
+	if denied != 0 {
+		t.Fatalf("provider hit %d times, want 0 (restart must be disk-served)", denied)
+	}
+}
+
+// TestDiskCache_NoLyricsNotPersistedAndShortTTL: a 404 ("no lyrics") is
+// never persisted (a song can gain lyrics later) and its memory shadow
+// expires on the SHORT TTL, so the relay re-checks the provider and picks
+// the lyric up once it appears.
+func TestDiskCache_NoLyricsNotPersistedAndShortTTL(t *testing.T) {
+	dir := t.TempDir()
+	hits := 0
+	hasLyrics := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		if !hasLyrics {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_, _ = w.Write([]byte(`{"syncedLyrics":"[00:01.00]one"}`))
+	}))
+	defer srv.Close()
+
+	l := newTestLyricsClient(srv.URL, time.Minute)
+	l.stateDir = dir
+	l.noLyricsTTL = 60 * time.Millisecond
+
+	// No lyrics yet: a clean "none" result — an empty (non-nil) lyricsData,
+	// no error, no pending.
+	if d, err := l.getForTrack(songTrack()); err != nil || d == nil || hasLyricsContent(*d) {
+		t.Fatalf("404 must be a clean no-lyrics result, got %v %+v", err, d)
+	}
+	diskDir := filepath.Join(dir, "lyrics")
+	if ents, err := os.ReadDir(diskDir); !os.IsNotExist(err) && len(ents) > 0 {
+		t.Fatalf("a 404 must not be persisted to disk: %v", ents)
+	}
+
+	// Lyrics appear on the provider; after the short window the relay must
+	// re-check and pick them up.
+	time.Sleep(120 * time.Millisecond)
+	hasLyrics = true
+	d, err := l.getForTrack(songTrack())
+	if err != nil || d == nil || !d.Synced {
+		t.Fatalf("the track must resolve once the provider has lyrics, got %v %+v", err, d)
+	}
+	if hits != 2 {
+		t.Fatalf("provider hit %d times, want 2 (404, then re-check)", hits)
+	}
+	// This time it IS persisted (resolved lyrics do go to disk).
+	if ents, err := os.ReadDir(diskDir); err != nil || len(ents) != 1 {
+		t.Fatalf("resolved lyrics must be persisted, got %v (%v)", ents, err)
+	}
+	// Third lookup: pure cache, no new hit.
+	if _, err := l.getForTrack(songTrack()); err != nil {
+		t.Fatalf("third lookup failed: %v", err)
+	}
+	if hits != 2 {
+		t.Fatalf("provider hit %d times, want 2 (third lookup must be cached)", hits)
+	}
+}
+
+// TestDiskCache_TTLExpiryForcesRefetch: a resolved entry past its TTL is
+// re-fetched from the provider (both memory and disk copies are stale).
+func TestDiskCache_TTLExpiryForcesRefetch(t *testing.T) {
+	dir := t.TempDir()
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		_, _ = w.Write([]byte(`{"syncedLyrics":"[00:01.00]one"}`))
+	}))
+	defer srv.Close()
+
+	l := newTestLyricsClient(srv.URL, time.Minute)
+	l.stateDir = dir
+	l.ttl = 80 * time.Millisecond
+
+	if _, err := l.getForTrack(songTrack()); err != nil {
+		t.Fatalf("first fetch failed: %v", err)
+	}
+	time.Sleep(150 * time.Millisecond) // let the TTL expire
+	if _, err := l.getForTrack(songTrack()); err != nil {
+		t.Fatalf("lookup after TTL expiry failed: %v", err)
+	}
+	if hits != 2 {
+		t.Fatalf("provider hit %d times, want 2 (TTL expiry must force a refetch)", hits)
+	}
+}
+
+// TestEnforceDiskLimit_EvictsOldest: once the cache exceeds the size budget
+// the oldest files go first; the newest survive.
+func TestEnforceDiskLimit_EvictsOldest(t *testing.T) {
+	dir := t.TempDir()
+	l := newTestLyricsClient("unused", time.Minute)
+	l.stateDir = dir
+	d := filepath.Join(dir, "lyrics")
+	if err := os.MkdirAll(d, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	content := make([]byte, 1024)
+	mk := func(name string, age time.Duration) {
+		p := filepath.Join(d, name)
+		if err := os.WriteFile(p, content, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		mt := time.Now().Add(-age)
+		if err := os.Chtimes(p, mt, mt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mk("old.json", 3*time.Hour)
+	mk("mid.json", 2*time.Hour)
+	mk("new.json", time.Hour)
+
+	l.maxSize = 2 * 1024 // room for exactly two 1KiB files
+	l.enforceDiskLimit()
+
+	have := map[string]bool{}
+	ents, err := os.ReadDir(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range ents {
+		have[e.Name()] = true
+	}
+	if have["old.json"] {
+		t.Fatalf("oldest file must be evicted: %v", ents)
+	}
+	if !have["mid.json"] || !have["new.json"] {
+		t.Fatalf("the two newest files must survive: %v", ents)
+	}
+}
+
+// TestEnforceMemCap_Bounded: the memory map is bounded — the oldest
+// RESOLVED entries leave the map (their files stay on disk) while error
+// entries are never evicted (they carry the backoff state).
+func TestEnforceMemCap_Bounded(t *testing.T) {
+	l := newTestLyricsClient("unused", time.Minute)
+	l.memCap = 3
+	base := time.Now().Add(-time.Hour)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for i := 0; i < 5; i++ {
+		l.cache[fmt.Sprintf("k%d|A", i)] = cacheEntry{
+			at:   base.Add(time.Duration(i) * time.Minute),
+			data: lyricsData{Plain: "x"},
+		}
+	}
+	l.cache["err|A"] = cacheEntry{at: base, err: errors.New("boom")}
+
+	l.enforceMemCap()
+
+	if _, ok := l.cache["k0|A"]; ok {
+		t.Fatal("oldest entry must be evicted")
+	}
+	if _, ok := l.cache["k1|A"]; ok {
+		t.Fatal("second-oldest entry must be evicted")
+	}
+	if _, ok := l.cache["k2|A"]; !ok {
+		t.Fatal("newer entries must survive")
+	}
+	if _, ok := l.cache["k4|A"]; !ok {
+		t.Fatal("newest entry must survive")
+	}
+	if _, ok := l.cache["err|A"]; !ok {
+		t.Fatal("error entries carry backoff state and must not be evicted")
+	}
+}
+
+// TestClearCache_WipesBothLayers: the operator wipe empties the memory map
+// and the on-disk files, reporting what was removed/freed.
+func TestClearCache_WipesBothLayers(t *testing.T) {
+	dir := t.TempDir()
+	l := newTestLyricsClient("unused", time.Minute)
+	l.stateDir = dir
+	d := filepath.Join(dir, "lyrics")
+	if err := os.MkdirAll(d, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"a.json", "b.json"} {
+		b := []byte(`{"key":"x","at":1,"data":{"plain":"a"}}`)
+		if err := os.WriteFile(filepath.Join(d, name), b, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	l.mu.Lock()
+	l.cache["m1|A"] = cacheEntry{at: time.Now(), data: lyricsData{Plain: "mem"}}
+	l.cache["m2|A"] = cacheEntry{at: time.Now(), err: errors.New("boom")}
+	l.mu.Unlock()
+
+	removed, freed, err := l.clear()
+	if err != nil {
+		t.Fatalf("clear failed: %v", err)
+	}
+	if removed != 4 {
+		t.Fatalf("removed = %d, want 4 (2 memory + 2 files)", removed)
+	}
+	if freed <= 0 {
+		t.Fatalf("freedBytes = %d, want > 0", freed)
+	}
+	l.mu.Lock()
+	notEmpty := len(l.cache) != 0
+	l.mu.Unlock()
+	if notEmpty {
+		t.Fatal("memory cache must be empty after clear")
+	}
+	if ents, err := os.ReadDir(d); err != nil || len(ents) != 0 {
+		t.Fatalf("disk cache must be empty after clear, got %v (%v)", ents, err)
+	}
+}
+
+// TestJanitorSweep_ExpiresMemoryAndDisk: a sweep pass drops entries past
+// their TTL in BOTH layers — resolved lyrics (long TTL) and "no lyrics"
+// shadows (short TTL) — and keeps fresh ones.
+func TestJanitorSweep_ExpiresMemoryAndDisk(t *testing.T) {
+	dir := t.TempDir()
+	l := newTestLyricsClient("unused", time.Minute)
+	l.stateDir = dir
+	l.ttl = 80 * time.Millisecond
+	l.noLyricsTTL = 80 * time.Millisecond
+
+	stale := time.Now().Add(-time.Hour)
+	fresh := time.Now()
+	l.mu.Lock()
+	l.cache["gone|A"] = cacheEntry{at: stale, data: lyricsData{Plain: "old"}}
+	l.cache["none|A"] = cacheEntry{at: stale, data: lyricsData{}} // 404 shadow
+	l.cache["fresh|A"] = cacheEntry{at: fresh, data: lyricsData{Plain: "kept"}}
+	l.mu.Unlock()
+
+	d := filepath.Join(dir, "lyrics")
+	if err := os.MkdirAll(d, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	w := func(name string, at time.Time, plain string) {
+		if err := os.WriteFile(filepath.Join(d, name),
+			[]byte(fmt.Sprintf(`{"key":"%s","at":%d,"data":{"plain":"%s"}}`, name, at.UnixMilli(), plain)),
+			0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w("stale.json", stale, "old")
+	w("fresh.json", fresh, "kept")
+
+	l.sweep()
+
+	l.mu.Lock()
+	_, hasGone := l.cache["gone|A"]
+	_, hasNone := l.cache["none|A"]
+	onlyFresh := len(l.cache) == 1
+	l.mu.Unlock()
+	if hasGone || hasNone {
+		t.Fatal("expired entries must leave the memory cache")
+	}
+	if !onlyFresh {
+		t.Fatal("fresh entries must survive the sweep")
+	}
+	ents, err := os.ReadDir(d)
+	if err != nil || len(ents) != 1 || ents[0].Name() != "fresh.json" {
+		t.Fatalf("stale files must be dropped, the fresh one kept, got %v (%v)", ents, err)
 	}
 }

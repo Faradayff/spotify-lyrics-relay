@@ -1,8 +1,12 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -172,5 +176,69 @@ func TestLyricPayloadPrevLine(t *testing.T) {
 	v, ok := p0["prevLine"].(string)
 	if !ok || v != "" {
 		t.Fatalf("prevLine at first line should be empty string, got %v (present=%v)", v, ok)
+	}
+}
+
+// TestHandleCacheClearWipesMemoryAndDisk: the operator endpoint empties
+// both cache layers (in-memory entries + on-disk files) and reports the
+// totals it freed.
+func TestHandleCacheClearWipesMemoryAndDisk(t *testing.T) {
+	srv := newUnauthServer(t) // STATE_DIR -> a fresh temp dir
+	lc := srv.lyrics
+
+	d := filepath.Join(lc.stateDir, "lyrics")
+	if err := os.MkdirAll(d, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(d, "x.json"),
+		[]byte(`{"key":"k","at":1,"data":{"plain":"p"}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A couple of in-memory entries (one resolved, one backoff).
+	lc.mu.Lock()
+	lc.cache["a|A"] = cacheEntry{at: time.Now(), data: lyricsData{Plain: "x"}}
+	lc.cache["b|B"] = cacheEntry{at: time.Now(), err: errors.New("boom")}
+	lc.mu.Unlock()
+
+	req := httptest.NewRequest(http.MethodPost, "/cache/clear", nil)
+	rr := httptest.NewRecorder()
+	srv.handleCacheClear(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("cache/clear = %d, want 200 (%s)", rr.Code, rr.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("bad JSON body: %v (%s)", err, rr.Body.String())
+	}
+	if ok, _ := body["ok"].(bool); !ok {
+		t.Fatalf("ok must be true: %v", body)
+	}
+	if removed, _ := body["removed"].(float64); removed != 3 {
+		t.Fatalf("removed = %v, want 3 (2 memory + 1 file)", body["removed"])
+	}
+	if freed, _ := body["freedBytes"].(float64); freed <= 0 {
+		t.Fatalf("freedBytes = %v, want > 0", body["freedBytes"])
+	}
+
+	lc.mu.Lock()
+	notEmpty := len(lc.cache) != 0
+	lc.mu.Unlock()
+	if notEmpty {
+		t.Fatal("memory cache must be empty after /cache/clear")
+	}
+	if ents, err := os.ReadDir(d); err != nil || len(ents) != 0 {
+		t.Fatalf("disk cache must be empty after /cache/clear, got %v (%v)", ents, err)
+	}
+}
+
+// TestHandleCacheClearPostOnly: same contract as /control — operator
+// actions are POST-only.
+func TestHandleCacheClearPostOnly(t *testing.T) {
+	srv := newUnauthServer(t)
+	req := httptest.NewRequest(http.MethodGet, "/cache/clear", nil)
+	rr := httptest.NewRecorder()
+	srv.handleCacheClear(rr, req)
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET cache/clear = %d, want 405", rr.Code)
 	}
 }

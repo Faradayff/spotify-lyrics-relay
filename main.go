@@ -38,6 +38,7 @@ func run(addr string) error {
 	mux.HandleFunc(base+"/logout", srv.handleLogout)
 	mux.HandleFunc(base+"/status", srv.handleStatus)
 	mux.HandleFunc("POST "+base+"/control", srv.handleControl)
+	mux.HandleFunc("POST "+base+"/cache/clear", srv.handleCacheClear)
 
 	// Liveness probe, always served at the root so container health-checks
 	// work regardless of RELAY_BASE_PATH, plus under the base path when one
@@ -48,6 +49,11 @@ func run(addr string) error {
 	}
 
 	go srv.runRefreshLoop(refreshInterval())
+	// Weekly lyrics-cache janitor: expires stale entries (memory + disk) and
+	// re-applies the disk size budget. The hot paths (startup, each new
+	// cache entry) already enforce limits; this sweeps what goes stale in
+	// between.
+	go srv.lyrics.runJanitor(janitorInterval)
 
 	// A panic anywhere in a handler must never take the whole process down:
 	// net/http does not recover handler panics, and on the relay the cost of

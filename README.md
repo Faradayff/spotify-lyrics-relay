@@ -159,6 +159,7 @@ Client pacing suggestion (the Android app does this): on a fast return
 | `GET /status` | The JSON API your apps consume |
 | `POST /control?action=next\|prev\|pause\|resume` | Control playback remotely |
 | `GET /logout` | Clears the stored tokens |
+| `POST /cache/clear` | Wipes the whole lyrics cache (memory + disk) — see [Lyrics cache](#lyrics-cache) |
 
 ### Example use in an automation
 
@@ -195,7 +196,11 @@ if (s.ok && s.auth) {
 - Multi-stage **Dockerfile**, non-root user, small Alpine runtime image.
 - Secrets (Spotify credentials) live only in environment variables / a
   volume, never baked into the image.
-- Automatic token refresh; tokens persisted to a `data/` volume.
+- Automatic token refresh; tokens and the lyrics cache live on a named
+  volume (`relay-data`), not on a host path.
+- Persistent **lyrics cache** (bounded in-memory + on-disk) so a song's lyrics
+  are fetched from the provider at most once per TTL — see
+  [Lyrics cache](#lyrics-cache).
 - CORS enabled on `/status` so browser-based frontends can call it.
 
 ## Spotify Developer Dashboard setup
@@ -292,8 +297,11 @@ user-read-playback-state user-read-currently-playing streaming
 | `SPOTIFY_REDIRECT_URI` | yes | Must match the registered one exactly (Spotify requires `https://...`, except loopback `http://127.0.0.1:PORT/...`). |
 | `RELAY_BASE_PATH` | no | Base path all routes are served under (e.g. `/lyrics`); empty for `http://127.0.0.1:8899/...`. Must be a prefix of `SPOTIFY_REDIRECT_URI`. |
 | `RELAY_ADDR` | no | Listen address, defaults to `:8899` |
-| `STATE_DIR` | no | Token storage dir (defaults to `/data` inside the container) |
+| `STATE_DIR` | no | State dir: Spotify tokens **and** the lyrics cache (defaults to `/data` inside the container) |
 | `RELAY_WAITS_REFRESH_MS` | no | How often the relay re-checks Spotify while clients are holding a `wait=1` request. Default `300` (ms), clamped to a 100 ms floor. The relay performs **no** Spotify calls while nobody is waiting. |
+| `LYRICS_TTL_DAYS` | no | How long resolved lyrics stay cached, in days. Default `365`; `0` = never expires. |
+| `LYRICS_TTL_NONE_DAYS` | no | How long a "no lyrics" (404) result is remembered, in days. Default `1`, kept **in memory only** — it is never written to disk, so a song that gains lyrics later is picked up. |
+| `LYRICS_CACHE_MAX_MB` | no | Size cap (MB) of the on-disk lyrics cache. Default `64`; `0` = unlimited. Oldest files are evicted first when the cap is exceeded. |
 
 ## Health checks
 
@@ -304,6 +312,42 @@ health-checks — Docker `HEALTHCHECK`, Synology Container Manager, a reverse
 proxy monitor, etc. — at it rather than at `/status` or the index page, which
 depend on the Spotify API and can outlive a short health-check budget (a
 timeout there would mark a perfectly healthy relay as failing).
+
+## Lyrics cache
+
+Resolved lyrics are cached in two layers, so the lyrics provider is queried at
+most once per song (per its TTL):
+
+1. **In memory** — bounded (~20 000 entries), the fastest path.
+2. **On disk** — one JSON file per song under `$STATE_DIR/lyrics/`, i.e. inside
+   the `relay-data` volume. This layer survives restarts and image rebuilds,
+   and is served even while the provider is rate-limiting the relay.
+
+Policy (all configurable):
+
+| What | Default | Env |
+|---|---|---|
+| Lifetime of a cached lyric | 365 days | `LYRICS_TTL_DAYS` (`0` = never) |
+| Lifetime of a "no lyrics" (404) result | 1 day, **memory only** | `LYRICS_TTL_NONE_DAYS` |
+| Size cap of the on-disk cache | 64 MB, oldest files first | `LYRICS_CACHE_MAX_MB` (`0` = unlimited) |
+
+A weekly background sweep expires stale entries in both layers; the size cap is
+also enforced at startup and after every new disk write.
+
+**Changed lyrics.** lrcLib is community-maintained, so a cached lyric is a
+snapshot. A song that *gains* lyrics later is picked up automatically (its 404
+only shadows for a day). If a song's lyrics get *corrected* upstream, wipe the
+cache to force a full re-fetch:
+
+```bash
+curl -X POST https://your-public.hostname/lyrics/cache/clear
+# → {"ok":true,"removed":137,"freedBytes":402112}
+```
+
+> The endpoint clears **only** the lyrics cache — your Spotify session
+> survives. Deleting the whole `relay-data` volume would also wipe the session
+> (you would have to run `/login` again) — prefer the endpoint. A brand-new
+> volume simply starts empty; lyrics re-cache on demand.
 
 ## Running with Docker
 
@@ -354,11 +398,19 @@ services:
       - SPOTIFY_REDIRECT_URI=https://your-public.hostname/lyrics/callback
       - RELAY_BASE_PATH=/lyrics
     volumes:
-      - ./data:/data
+      - relay-data:/data
+
+volumes:
+  relay-data:
 ```
 
 Keep `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` in `.env` (next to the
 compose file), not in the image or a committed file.
+
+`relay-data` is a **named volume** (no host path): Compose creates it for
+you, and it holds the Spotify session **and** the lyrics cache. If you were on
+the old `./data` host bind-mount, the new volume starts empty — log in once
+via `/login` and the lyrics cache rebuilds on demand.
 
 ### Option B2 — dedicated subdomain (root path)
 
@@ -448,7 +500,7 @@ So the public URLs are:
 
 4. **Log in**: open `https://your-public.hostname/lyrics/login` in a browser,
    authorize; Spotify redirects to `.../callback` and the tokens are saved to
-   the `data/` volume.
+  the `relay-data` volume.
 
 5. **From any client** (car, dashboard, HA, …):
    ```bash
@@ -462,13 +514,16 @@ So the public URLs are:
 > - If you ever need to change the base path (e.g. from `/lyrics` to
 >   `/spotify`), keep the proxy rule, `RELAY_BASE_PATH` and the Spotify
 >   redirect URI all in sync; the relay has no fallback.
-> - The `data/` directory is the token store — do not delete it between
->   upgrades or you will have to log in again.
+> - The `relay-data` volume is the state store (Spotify session **and** the
+>   lyrics cache) — do not delete it between upgrades or you will have to log
+>   in again and re-cache lyrics. To drop *only* the cached lyrics, use
+>   `POST /cache/clear` instead.
 
 ## Security
 
 - The process runs as a non-root user (`relay`) inside the container.
-- Tokens are stored in a mounted volume (`data/`), not in the image.
+- Tokens and the lyrics cache live in a named volume (`relay-data`), not on
+  the host and not in the image.
 - The image contains **no** secrets (runtime environment only).
 - The relay binds to `127.0.0.1:8899` on the host only; the public surface is
   whatever your reverse proxy exposes. Add authentication in front of

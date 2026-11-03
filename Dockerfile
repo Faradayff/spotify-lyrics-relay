@@ -16,8 +16,10 @@ FROM alpine:3.20
 RUN addgroup -S relay && adduser -S relay -G relay
 WORKDIR /app
 COPY --from=build /relay /usr/local/bin/relay
-# State (tokens.json) kept outside the binary
+# State (tokens.json + lyrics cache) kept outside the binary
 RUN mkdir -p /data && chown relay:relay /data
+# Lyrics cache dir pre-created so the (named) state volume inherits ownership
+RUN mkdir -p /data/lyrics && chown relay:relay /data/lyrics
 ENV STATE_DIR=/data
 USER relay
 EXPOSE 8899

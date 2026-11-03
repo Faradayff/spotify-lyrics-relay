@@ -16,7 +16,11 @@ services:
       - RELAY_BASE_PATH=${RELAY_BASE_PATH:-/lyrics}
       - STATE_DIR=/data
     volumes:
-      - ./data:/data
+      # Tokens + lyrics cache on a named volume (NO host mapping): it
+      # survives `docker compose down` and image rebuilds. A fresh volume
+      # starts empty — open /login once and the lyrics cache builds itself
+      # as tracks play.
+      - relay-data:/data
     # /healthz is dependency-free (no Spotify call) and always at the root,
     # so it works with or without RELAY_BASE_PATH.
     healthcheck:
@@ -24,3 +28,7 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
+
+# Named-state volume (created by compose, never bind-mounted to the host).
+volumes:
+  relay-data:

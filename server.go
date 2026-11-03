@@ -391,6 +391,31 @@ func (s *relayServer) handleControl(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "action": action})
 }
 
+// handleCacheClear wipes the WHOLE lyrics cache — the in-memory map and the
+// on-disk files — so every track re-resolves against the provider on its
+// next play. That is the escape hatch for a lyric that changed upstream
+// (lrcLib is community-edited) and for a mass re-fetch after any policy
+// change. POST only, unauthenticated like /control: it is an operator route
+// on a single-tenant relay behind the TLS proxy.
+func (s *relayServer) handleCacheClear(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Cache-Control", "no-store")
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	removed, freed, err := s.lyrics.clear()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":         true,
+		"removed":    removed,
+		"freedBytes": freed,
+	})
+}
+
 // handleHealthz is a dependency-free liveness probe: it reports that the
 // process is serving and whether a Spotify session exists, without calling
 // Spotify or the lyrics API. It must always answer fast, because it backs
@@ -463,7 +488,8 @@ a{color:#1db954} code{background:#1a1a1a;padding:1px 4px}</style>
   <b>Spotify</b>: %s<br>
   <b>Actions</b>: <a href="login">log in</a> &middot; <a href="logout">log out</a><br>
   <b>Car app</b>: <code>GET status</code> (JSON, CORS open)<br>
-  <b>Controls</b>: <code>POST control?action=next|prev|pause|resume</code>
+  <b>Controls</b>: <code>POST control?action=next|prev|pause|resume</code><br>
+  <b>Cache</b>: <code>POST cache/clear</code> (wipe the lyrics cache)
 </div>
 </body></html>
 `, status)

@@ -1,14 +1,20 @@
 package main
 
 import (
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,10 +23,21 @@ import (
 
 const (
 	lrclibBase = "https://lrclib.net/api"
-	// cacheTTL: a successful lookup is effectively immutable for us (a
-	// song's lyrics do not change), so a long TTL keeps repeated plays of
-	// the same track completely off the wire.
-	cacheTTL = 30 * 24 * time.Hour
+	// Default lyrics-cache policy (all overridable via env in
+	// newLyricsClient; 0 always means "never expires" / "unlimited"). A
+	// song's lyrics are effectively immutable, so a long TTL plus the
+	// on-disk cache keep repeated plays of a known track off the wire.
+	defaultLyricsTTLDays = 365 // resolved lyrics (LYRICS_TTL_DAYS)
+	defaultNoneTTLDays   = 1   // "no lyrics" (404), memory only (LYRICS_TTL_NONE_DAYS)
+	defaultMaxCacheMB    = 64  // on-disk budget (LYRICS_CACHE_MAX_MB)
+	// memCapDefault bounds the in-memory layer: entries beyond it (oldest
+	// first) leave the map but stay on disk, so the cost is one small file
+	// re-read the next time the track plays.
+	memCapDefault = 20000
+	// janitorInterval: cadence of the periodic cache sweep (expired entries
+	// + disk budget). Weekly: the budgets are generous and lyrics rarely
+	// churn; the hot paths (startup, each new entry) already enforce.
+	janitorInterval = 7 * 24 * time.Hour
 	// errorCacheTTL: how long a failed provider fetch (429/5xx/transport)
 	// is replayed as "pending" instead of being re-requested. Doubles with
 	// each consecutive failure per track (see errWindowFor), capped by
@@ -150,21 +167,63 @@ type lyricsClient struct {
 	retryBase []time.Duration // inline waits between transport-error retries (tests shorten)
 	sleep     func(time.Duration)
 	http      *http.Client
+
+	// stateDir: where persisted state lives ($STATE_DIR in the container,
+	// "data" otherwise); resolved lyrics are stored in stateDir/lyrics/.
+	stateDir string
+	// ttl: how long a RESOLVED lyric stays valid — in memory and on disk
+	// (0 = never expires). LYRICS_TTL_DAYS.
+	ttl time.Duration
+	// noLyricsTTL: how long a 404/"no lyrics" result is remembered (memory
+	// only, never persisted): a song can gain lyrics later, so it must be
+	// re-checked within this window (0 = never re-check).
+	// LYRICS_TTL_NONE_DAYS.
+	noLyricsTTL time.Duration
+	// maxSize: the on-disk cache budget in bytes (0 = unlimited).
+	// LYRICS_CACHE_MAX_MB.
+	maxSize int64
+	// memCap: in-memory entry cap (0 = unlimited).
+	memCap int
 }
 
 func newLyricsClient() *lyricsClient {
-	return &lyricsClient{
-		base:      lrclibBase,
-		cache:     map[string]cacheEntry{},
-		inflight:  map[string]struct{}{},
-		now:       time.Now,
-		minGap:    minUpstreamGap,
-		logf:      log.Printf,
-		errTTL:    errorCacheTTL,
-		retryBase: []time.Duration{750 * time.Millisecond, 2 * time.Second},
-		sleep:     time.Sleep,
-		http:      &http.Client{Timeout: 20 * time.Second},
+	sd := os.Getenv("STATE_DIR")
+	if sd == "" {
+		sd = "data"
 	}
+	l := &lyricsClient{
+		base:        lrclibBase,
+		cache:       map[string]cacheEntry{},
+		inflight:    map[string]struct{}{},
+		now:         time.Now,
+		minGap:      minUpstreamGap,
+		logf:        log.Printf,
+		errTTL:      errorCacheTTL,
+		retryBase:   []time.Duration{750 * time.Millisecond, 2 * time.Second},
+		sleep:       time.Sleep,
+		http:        &http.Client{Timeout: 20 * time.Second},
+		stateDir:    sd,
+		ttl:         time.Duration(envNonNeg("LYRICS_TTL_DAYS", defaultLyricsTTLDays)) * 24 * time.Hour,
+		noLyricsTTL: time.Duration(envNonNeg("LYRICS_TTL_NONE_DAYS", defaultNoneTTLDays)) * 24 * time.Hour,
+		maxSize:     int64(envNonNeg("LYRICS_CACHE_MAX_MB", defaultMaxCacheMB)) << 20,
+		memCap:      memCapDefault,
+	}
+	// Startup: apply the disk budget (drop the oldest files past it). TTL
+	// expiry is per-lookup (each entry is age-checked on read) and the
+	// weekly janitor sweeps the rest.
+	l.enforceDiskLimit()
+	return l
+}
+
+// envNonNeg reads a non-negative integer env var, falling back to def when
+// it is absent, non-numeric or negative (a negative encodes no valid policy).
+func envNonNeg(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			return n
+		}
+	}
+	return def
 }
 
 var reStamp = regexp.MustCompile(`\[(\d{1,3}):(\d{1,2})(?:[.:](\d{1,3}))?\]`)
@@ -372,6 +431,267 @@ func decodeLyrics(m map[string]any) lyricsData {
 	return out
 }
 
+// --- persistent cache: one JSON file per resolved track, under STATE_DIR/lyrics ---
+
+// persistentEntry is the on-disk form of a resolved lyrics entry. The key
+// round-trips so the files are self-describing (diagnostics / cache report);
+// the memory map stays keyed by the human-readable "id|artist" form.
+type persistentEntry struct {
+	Key  string     `json:"key"` // "spotifyTrackId|artistName"
+	At   int64      `json:"at"`  // fetch time, unix milliseconds
+	Data lyricsData `json:"data"`
+}
+
+func (l *lyricsClient) cacheDir() string {
+	return filepath.Join(l.stateDir, "lyrics")
+}
+
+// diskFileName hashes the cache key: track ids and artist names can carry
+// characters a filesystem should not have to deal with on file names.
+func diskFileName(key string) string {
+	sum := sha1.Sum([]byte(key))
+	return hex.EncodeToString(sum[:]) + ".json"
+}
+
+func readPersistentEntry(path string) (persistentEntry, bool) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return persistentEntry{}, false
+	}
+	var pe persistentEntry
+	if err := json.Unmarshal(b, &pe); err != nil || pe.Key == "" || pe.At <= 0 {
+		return persistentEntry{}, false
+	}
+	return pe, true
+}
+
+// storeToDisk persists a resolved lyric. Best-effort: a disk write failure
+// must never fail the lookup (the entry still lives in memory).
+func (l *lyricsClient) storeToDisk(key string, data lyricsData) {
+	dir := l.cacheDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		l.logf("lyrics cache: cannot create %s: %v", dir, err)
+		return
+	}
+	b, err := json.Marshal(persistentEntry{Key: key, At: l.now().UnixMilli(), Data: data})
+	if err != nil {
+		return
+	}
+	path := filepath.Join(dir, diskFileName(key))
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+		l.logf("lyrics cache: write %s: %v", path, err)
+		return
+	}
+	if err := os.Rename(tmp, path); err != nil { // atomic rename inside the same volume
+		l.logf("lyrics cache: rename %s: %v", path, err)
+		_ = os.Remove(tmp)
+	}
+}
+
+// readFromDisk is the disk read-through: it returns a FRESH entry for the
+// key, or a miss (deleting the file first) when it is corrupt, belongs to a
+// different key, or is past its TTL. A missing file is a plain miss.
+func (l *lyricsClient) readFromDisk(key string) (cacheEntry, bool) {
+	path := filepath.Join(l.cacheDir(), diskFileName(key))
+	pe, ok := readPersistentEntry(path)
+	if !ok || pe.Key != key {
+		_ = os.Remove(path) // corrupt or mismatched: drop it (no-op if absent)
+		return cacheEntry{}, false
+	}
+	at := time.UnixMilli(pe.At)
+	ttl := l.ttlFor(pe.Data)
+	if ttl > 0 && l.now().Sub(at) >= ttl {
+		_ = os.Remove(path) // expired: re-resolve against the provider
+		return cacheEntry{}, false
+	}
+	return cacheEntry{at: at, data: pe.Data}, true
+}
+
+// ttlFor picks the TTL of a cached result: resolved content uses the long
+// TTL, a 404/"no lyrics" one the short one (the song may gain lyrics later
+// and must be re-checked).
+func (l *lyricsClient) ttlFor(data lyricsData) time.Duration {
+	if hasLyricsContent(data) {
+		return l.ttl
+	}
+	return l.noLyricsTTL
+}
+
+// hasLyricsContent reports whether a lookup resolved to actual lyrics (as
+// opposed to a 404 "no lyrics" / empty response).
+func hasLyricsContent(d lyricsData) bool {
+	return d.Synced || d.Plain != "" || len(d.Lines) > 0
+}
+
+// enforceMemCap trims the in-memory cache to memCap entries, dropping the
+// OLDEST resolved ones — their files stay on disk and are re-read on demand.
+// Error entries are never evicted: they carry the backoff state that keeps
+// the refresh loop from re-hitting the provider. Called with l.mu held.
+func (l *lyricsClient) enforceMemCap() {
+	if l.memCap <= 0 {
+		return
+	}
+	type kv struct {
+		k  string
+		at time.Time
+	}
+	list := make([]kv, 0, len(l.cache))
+	for k, e := range l.cache {
+		if e.err == nil {
+			list = append(list, kv{k, e.at})
+		}
+	}
+	if over := len(list) - l.memCap; over > 0 {
+		sort.Slice(list, func(i, j int) bool { return list[i].at.Before(list[j].at) })
+		for _, it := range list[:over] {
+			delete(l.cache, it.k)
+		}
+	}
+}
+
+// enforceDiskLimit trims the on-disk cache to maxSize bytes, dropping the
+// OLDEST files first. It uses file mtimes (write time ≈ fetch time), so no
+// file needs a full parse.
+func (l *lyricsClient) enforceDiskLimit() {
+	if l.stateDir == "" || l.maxSize <= 0 {
+		return
+	}
+	dir := l.cacheDir()
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	type df struct {
+		path  string
+		mtime time.Time
+		size  int64
+	}
+	files := make([]df, 0, len(ents))
+	for _, e := range ents {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		fi, err := e.Info()
+		if err != nil {
+			continue
+		}
+		files = append(files, df{filepath.Join(dir, e.Name()), fi.ModTime(), fi.Size()})
+	}
+	// Newest first: keep each file while the budget allows it.
+	sort.Slice(files, func(i, j int) bool { return files[i].mtime.After(files[j].mtime) })
+	budget := l.maxSize
+	for _, f := range files {
+		if f.size > budget { // over budget: evict (this walks oldest last)
+			_ = os.Remove(f.path)
+			continue
+		}
+		budget -= f.size
+	}
+}
+
+// sweepExpiredMemory drops in-memory resolved entries past their TTL (error
+// entries keep their backoff semantics: their window is always short and
+// self-clearing).
+func (l *lyricsClient) sweepExpiredMemory() {
+	l.mu.Lock()
+	now := l.now()
+	for k, e := range l.cache {
+		if e.err != nil {
+			continue
+		}
+		ttl := l.ttlFor(e.data)
+		if ttl > 0 && now.Sub(e.at) >= ttl {
+			delete(l.cache, k)
+		}
+	}
+	l.mu.Unlock()
+}
+
+// sweepExpiredDisk drops on-disk files past their TTL (and corrupt files
+// outright).
+func (l *lyricsClient) sweepExpiredDisk() {
+	if l.stateDir == "" {
+		return
+	}
+	dir := l.cacheDir()
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range ents {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		path := filepath.Join(dir, e.Name())
+		pe, ok := readPersistentEntry(path)
+		if !ok {
+			_ = os.Remove(path)
+			continue
+		}
+		ttl := l.ttlFor(pe.Data)
+		if ttl > 0 && l.now().Sub(time.UnixMilli(pe.At)) >= ttl {
+			_ = os.Remove(path)
+		}
+	}
+}
+
+// sweep is the full janitor pass: expire the memory and disk entries, then
+// re-apply the disk budget.
+func (l *lyricsClient) sweep() {
+	l.sweepExpiredMemory()
+	l.sweepExpiredDisk()
+	l.enforceDiskLimit()
+}
+
+// runJanitor runs a full sweep once every interval. Only the long-lived
+// process (main) starts it; tests drive the individual passes directly.
+func (l *lyricsClient) runJanitor(interval time.Duration) {
+	tick := time.NewTicker(interval)
+	for range tick.C {
+		l.sweep()
+	}
+}
+
+// clear wipes the WHOLE lyrics cache: the in-memory map (resolved entries
+// and backoff states) and the on-disk files. It reports how many entries
+// and files were removed and how many bytes were freed.
+func (l *lyricsClient) clear() (int, int64, error) {
+	l.mu.Lock()
+	removed := len(l.cache)
+	for k := range l.cache {
+		delete(l.cache, k)
+	}
+	l.mu.Unlock()
+
+	if l.stateDir == "" {
+		return removed, 0, nil
+	}
+	dir := l.cacheDir()
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return removed, 0, nil
+		}
+		return removed, 0, err
+	}
+	var freed int64
+	for _, e := range ents {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		path := filepath.Join(dir, e.Name())
+		if fi, err := e.Info(); err == nil {
+			freed += fi.Size()
+		}
+		if err := os.Remove(path); err != nil {
+			return removed, freed, err
+		}
+		removed++
+	}
+	return removed, freed, nil
+}
+
 // errWindow is the effective replay window for a cached provider failure.
 func (l *lyricsClient) errWindow(e cacheEntry) time.Duration {
 	if e.errTTL > 0 {
@@ -427,11 +747,29 @@ func (l *lyricsClient) getForTrack(track map[string]any) (*lyricsData, error) {
 				l.mu.Unlock()
 				return nil, lyricsPendingError(e.err, w-age)
 			}
-		} else if age < cacheTTL {
+		} else if ttl := l.ttlFor(e.data); ttl == 0 || age < ttl {
 			l.mu.Unlock()
 			return &e.data, nil // cached success: zero provider traffic
 		}
 	}
+	l.mu.Unlock()
+
+	// Persistent cache (the on-disk file, survives restarts): a fresh entry
+	// resolves with zero provider traffic, even while a backoff window is
+	// open — a disk read is not a provider request. Expired or corrupt
+	// files drop themselves (readFromDisk).
+	if l.stateDir != "" {
+		if e, ok := l.readFromDisk(key); ok {
+			l.mu.Lock()
+			l.cache[key] = e
+			l.enforceMemCap()
+			l.mu.Unlock()
+			return &e.data, nil
+		}
+	}
+
+	l.mu.Lock()
+	now = l.now()
 	// Provider overload is client-wide (lrcLib limits US, not the track):
 	// while the global backoff window is open, no track at all may fire a
 	// real request. The refresh loop retries this track when it opens.
@@ -471,6 +809,15 @@ func (l *lyricsClient) getForTrack(track map[string]any) (*lyricsData, error) {
 	}
 	out := decodeLyrics(m)
 
+	// Persist the resolved lyrics (best-effort: a disk problem must never
+	// fail the lookup). A 404 "no lyrics" result is deliberately NOT
+	// written to disk — it keeps the short memory-only re-check TTL, so a
+	// song that gains lyrics later is picked up again.
+	if l.stateDir != "" && hasLyricsContent(out) {
+		l.storeToDisk(key, out)
+		l.enforceDiskLimit()
+	}
+
 	var retryIn time.Duration
 	l.mu.Lock()
 	now = l.now()
@@ -489,6 +836,7 @@ func (l *lyricsClient) getForTrack(track map[string]any) (*lyricsData, error) {
 		l.applyGlobalWindow(perr, now)
 	}
 	l.cache[key] = e
+	l.enforceMemCap()
 	l.mu.Unlock()
 	if cause != nil {
 		// Pending, not an error: the surface shows "loading" and the relay
