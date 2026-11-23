@@ -864,6 +864,78 @@ func TestClearCache_WipesBothLayers(t *testing.T) {
 	}
 }
 
+// TestDeleteForTrack_RemovesMemoryAndDisk: the targeted drop empties BOTH
+// layers for the requested key and reports what it removed/freed — the entry
+// is gone from the map AND from disk, so the next lookup re-fetches.
+func TestDeleteForTrack_RemovesMemoryAndDisk(t *testing.T) {
+	dir := t.TempDir()
+	l := newTestLyricsClient("unused", time.Minute)
+	l.stateDir = dir
+	tr := songTrack() // key "track-1|Band"
+	l.mu.Lock()
+	l.cache["track-1|Band"] = cacheEntry{at: time.Now(), data: lyricsData{Plain: "wrong lyric"}}
+	l.mu.Unlock()
+	l.storeToDisk("track-1|Band", lyricsData{Plain: "wrong lyric"})
+
+	removed, freed, err := l.deleteForTrack(tr)
+	if err != nil {
+		t.Fatalf("deleteForTrack failed: %v", err)
+	}
+	if removed != 2 {
+		t.Fatalf("removed = %d, want 2 (memory entry + disk file)", removed)
+	}
+	if freed <= 0 {
+		t.Fatalf("freedBytes = %d, want > 0", freed)
+	}
+	l.mu.Lock()
+	_, inMem := l.cache["track-1|Band"]
+	l.mu.Unlock()
+	if inMem {
+		t.Fatal("memory entry must be gone after deleteForTrack")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "lyrics", diskFileName("track-1|Band"))); !os.IsNotExist(err) {
+		t.Fatalf("disk file must be gone after deleteForTrack: %v", err)
+	}
+}
+
+// TestDeleteForTrack_OtherTracksSurvive: invalidation is targeted — the
+// rest of the cache (the app kept every other song) must survive untouched.
+func TestDeleteForTrack_OtherTracksSurvive(t *testing.T) {
+	l := newTestLyricsClient("unused", time.Minute)
+	other := map[string]any{"id": "track-2", "name": "Other", "artist": "Band"}
+	l.mu.Lock()
+	l.cache[l.keyFor(songTrack())] = cacheEntry{at: time.Now(), data: lyricsData{Plain: "x"}}
+	l.cache[l.keyFor(other)] = cacheEntry{at: time.Now(), data: lyricsData{Plain: "y"}}
+	l.mu.Unlock()
+
+	removed, _, err := l.deleteForTrack(songTrack())
+	if err != nil || removed != 1 {
+		t.Fatalf("deleteForTrack = %d, %v; want 1, nil", removed, err)
+	}
+	l.mu.Lock()
+	_, hasT1 := l.cache["track-1|Band"]
+	_, hasT2 := l.cache["track-2|Band"]
+	l.mu.Unlock()
+	if hasT1 {
+		t.Fatal("the deleted track must be gone from memory")
+	}
+	if !hasT2 {
+		t.Fatal("the other track must survive")
+	}
+}
+
+// TestDeleteForTrack_Idempotent: deleting a track that was never cached is
+// a no-op (removed = 0), not an error — the app may freely re-tap the
+// settings option.
+func TestDeleteForTrack_Idempotent(t *testing.T) {
+	l := newTestLyricsClient("unused", time.Minute)
+	l.stateDir = t.TempDir()
+	removed, freed, err := l.deleteForTrack(songTrack())
+	if err != nil || removed != 0 || freed != 0 {
+		t.Fatalf("delete of an absent track = %d, %d, %v; want 0, 0, nil", removed, freed, err)
+	}
+}
+
 // TestJanitorSweep_ExpiresMemoryAndDisk: a sweep pass drops entries past
 // their TTL in BOTH layers — resolved lyrics (long TTL) and "no lyrics"
 // shadows (short TTL) — and keeps fresh ones.

@@ -692,6 +692,37 @@ func (l *lyricsClient) clear() (int, int64, error) {
 	return removed, freed, nil
 }
 
+// deleteForTrack drops ONE track's cached lyrics from both layers (the
+// in-memory entry and the on-disk file) — the targeted companion of clear(),
+// for a single song whose stored lyric is known to be wrong. The next lookup
+// for that key misses both layers and re-resolves against the provider.
+// Idempotent: removing a track that was never cached is a no-op
+// (removed = 0), not an error.
+func (l *lyricsClient) deleteForTrack(track map[string]any) (removed int, freed int64, err error) {
+	key := l.keyFor(track)
+
+	l.mu.Lock()
+	if _, ok := l.cache[key]; ok {
+		delete(l.cache, key)
+		removed++
+	}
+	l.mu.Unlock()
+
+	if l.stateDir != "" {
+		path := filepath.Join(l.cacheDir(), diskFileName(key))
+		if fi, statErr := os.Stat(path); statErr == nil {
+			freed = fi.Size()
+			if err = os.Remove(path); err != nil {
+				return removed, freed, err
+			}
+			removed++
+		} else if !errors.Is(statErr, fs.ErrNotExist) {
+			return removed, freed, statErr
+		}
+	}
+	return removed, freed, nil
+}
+
 // errWindow is the effective replay window for a cached provider failure.
 func (l *lyricsClient) errWindow(e cacheEntry) time.Duration {
 	if e.errTTL > 0 {
@@ -728,11 +759,19 @@ func (l *lyricsClient) errWindowFor(perr *providerError, prevFails int) time.Dur
 	return w
 }
 
+// keyFor builds the cache key for a track: "<spotifyTrackId>|<artist>". It is
+// the single source of truth shared by the lookup (getForTrack) and the
+// targeted invalidation (deleteForTrack), so a delete always hits the exact
+// key a store would (re)use.
+func (l *lyricsClient) keyFor(track map[string]any) string {
+	return fmt.Sprintf("%v", track["id"]) + "|" + l.artistName(track)
+}
+
 func (l *lyricsClient) getForTrack(track map[string]any) (*lyricsData, error) {
 	if track == nil {
 		return nil, fmt.Errorf("nil track")
 	}
-	key := fmt.Sprintf("%v", track["id"]) + "|" + l.artistName(track)
+	key := l.keyFor(track)
 
 	l.mu.Lock()
 	now := l.now()

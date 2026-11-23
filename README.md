@@ -160,6 +160,7 @@ Client pacing suggestion (the Android app does this): on a fast return
 | `POST /control?action=next\|prev\|pause\|resume` | Control playback remotely |
 | `GET /logout` | Clears the stored tokens |
 | `POST /cache/clear` | Wipes the whole lyrics cache (memory + disk) — see [Lyrics cache](#lyrics-cache) |
+| `POST /cache/track?id=...&artist=...` | Drops the cached lyric of ONE track; the next `/status` re-fetches it |
 
 ### Example use in an automation
 
@@ -348,6 +349,21 @@ curl -X POST https://your-public.hostname/lyrics/cache/clear
 > survives. Deleting the whole `relay-data` volume would also wipe the session
 > (you would have to run `/login` again) — prefer the endpoint. A brand-new
 > volume simply starts empty; lyrics re-cache on demand.
+
+**Wrong lyric, one song.** If a single song's cached lyric looks off, you
+don't have to wipe everything: drop just that track and the next `/status`
+re-resolves it against the provider (the app uses this from its settings for
+the track currently playing):
+
+```bash
+curl -X POST 'https://your-public.hostname/lyrics/cache/track?id=<spotifyTrackId>&artist=<artist>'
+# → {"ok":true,"id":"3q2CVvw9bZu6aWn1PnS4jF","removed":2,"freedBytes":512}
+```
+
+`id` and `artist` are the same `track.id` / `track.artist` values `/status`
+reports for that song (URL-encoded when they contain special characters).
+Deleting a track that was never cached is a no-op (`"removed":0`), so the
+action is safely repeatable.
 
 ## Running with Docker
 

@@ -39,6 +39,7 @@ func run(addr string) error {
 	mux.HandleFunc(base+"/status", srv.handleStatus)
 	mux.HandleFunc("POST "+base+"/control", srv.handleControl)
 	mux.HandleFunc("POST "+base+"/cache/clear", srv.handleCacheClear)
+	mux.HandleFunc("POST "+base+"/cache/track", srv.handleCacheTrack)
 
 	// Liveness probe, always served at the root so container health-checks
 	// work regardless of RELAY_BASE_PATH, plus under the base path when one

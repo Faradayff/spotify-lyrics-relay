@@ -416,6 +416,39 @@ func (s *relayServer) handleCacheClear(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleCacheTrack drops the cached lyrics of ONE track — the targeted
+// companion of /cache/clear. The app uses it from its settings to discard a
+// song's wrong lyric so the next /status re-fetches it from the provider.
+// The track identity is the id + artist pair the /status payload reports
+// (it IS the cache key), so the app round-trips exactly what it last saw.
+// POST only, unauthenticated like the other operator cache routes: a
+// single-tenant relay behind the TLS proxy.
+func (s *relayServer) handleCacheTrack(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Cache-Control", "no-store")
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	q := r.URL.Query()
+	id := q.Get("id")
+	if id == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "id query parameter is required"})
+		return
+	}
+	removed, freed, err := s.lyrics.deleteForTrack(map[string]any{"id": id, "artist": q.Get("artist")})
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":         true,
+		"id":         id,
+		"removed":    removed,
+		"freedBytes": freed,
+	})
+}
+
 // handleHealthz is a dependency-free liveness probe: it reports that the
 // process is serving and whether a Spotify session exists, without calling
 // Spotify or the lyrics API. It must always answer fast, because it backs
@@ -489,7 +522,7 @@ a{color:#1db954} code{background:#1a1a1a;padding:1px 4px}</style>
   <b>Actions</b>: <a href="login">log in</a> &middot; <a href="logout">log out</a><br>
   <b>Car app</b>: <code>GET status</code> (JSON, CORS open)<br>
   <b>Controls</b>: <code>POST control?action=next|prev|pause|resume</code><br>
-  <b>Cache</b>: <code>POST cache/clear</code> (wipe the lyrics cache)
+  <b>Cache</b>: <code>POST cache/clear</code> (wipe the whole lyrics cache) &middot; <code>POST cache/track?id=&amp;artist=</code> (invalidate one track)
 </div>
 </body></html>
 `, status)

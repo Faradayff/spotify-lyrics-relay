@@ -242,3 +242,88 @@ func TestHandleCacheClearPostOnly(t *testing.T) {
 		t.Fatalf("GET cache/clear = %d, want 405", rr.Code)
 	}
 }
+
+// TestHandleCacheTrackInvalidatesOneEntry: the endpoint drops a single
+// track from BOTH cache layers (the wrong-lyric escape hatch from the app's
+// settings), leaving every other cached song untouched.
+func TestHandleCacheTrackInvalidatesOneEntry(t *testing.T) {
+	srv := newUnauthServer(t) // STATE_DIR -> a fresh temp dir
+	lc := srv.lyrics
+
+	key := "track-1|Band"
+	lc.mu.Lock()
+	lc.cache[key] = cacheEntry{at: time.Now(), data: lyricsData{Plain: "wrong lyric"}}
+	lc.cache["track-2|Band"] = cacheEntry{at: time.Now(), data: lyricsData{Plain: "other song"}}
+	lc.mu.Unlock()
+	lc.storeToDisk(key, lyricsData{Plain: "wrong lyric"})
+
+	req := httptest.NewRequest(http.MethodPost, "/cache/track?id=track-1&artist=Band", nil)
+	rr := httptest.NewRecorder()
+	srv.handleCacheTrack(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("/cache/track = %d, want 200 (%s)", rr.Code, rr.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("bad JSON body: %v (%s)", err, rr.Body.String())
+	}
+	if ok, _ := body["ok"].(bool); !ok {
+		t.Fatalf("ok must be true: %v", body)
+	}
+	if removed, _ := body["removed"].(float64); removed != 2 {
+		t.Fatalf("removed = %v, want 2 (memory entry + disk file)", body["removed"])
+	}
+	if freed, _ := body["freedBytes"].(float64); freed <= 0 {
+		t.Fatalf("freedBytes = %v, want > 0", body["freedBytes"])
+	}
+
+	lc.mu.Lock()
+	_, deleted := lc.cache[key]
+	_, other := lc.cache["track-2|Band"]
+	lc.mu.Unlock()
+	if deleted {
+		t.Fatal("the requested track must be gone from the memory cache")
+	}
+	if !other {
+		t.Fatal("other cached tracks must survive")
+	}
+	// The deleted track's disk file is gone; nothing else was on disk.
+	if ents, err := os.ReadDir(filepath.Join(lc.stateDir, "lyrics")); err != nil || len(ents) != 0 {
+		t.Fatalf("disk cache must be empty for the deleted track, got %v (%v)", ents, err)
+	}
+}
+
+// TestHandleCacheTrackPostOnly: same contract as /cache/clear — operator
+// actions are POST-only.
+func TestHandleCacheTrackPostOnly(t *testing.T) {
+	srv := newUnauthServer(t)
+	req := httptest.NewRequest(http.MethodGet, "/cache/track?id=track-1&artist=Band", nil)
+	rr := httptest.NewRecorder()
+	srv.handleCacheTrack(rr, req)
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET /cache/track = %d, want 405", rr.Code)
+	}
+}
+
+// TestHandleCacheTrackRequiresID: a request without a track id cannot be
+// targeted and must be rejected before touching any cache state.
+func TestHandleCacheTrackRequiresID(t *testing.T) {
+	srv := newUnauthServer(t)
+	lc := srv.lyrics
+	lc.mu.Lock()
+	lc.cache["track-1|Band"] = cacheEntry{at: time.Now(), data: lyricsData{Plain: "x"}}
+	lc.mu.Unlock()
+
+	req := httptest.NewRequest(http.MethodPost, "/cache/track?artist=Band", nil)
+	rr := httptest.NewRecorder()
+	srv.handleCacheTrack(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("POST /cache/track without id = %d, want 400", rr.Code)
+	}
+	lc.mu.Lock()
+	_, still := lc.cache["track-1|Band"]
+	lc.mu.Unlock()
+	if !still {
+		t.Fatal("a rejected request must not delete anything")
+	}
+}
